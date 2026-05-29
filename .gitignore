@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+
+.venv/
+venv/
+env/
+
+# Previously this was a blanket `*.json` which silently excluded
+# frontend/package.json, package-lock.json and tsconfig*.json — so fresh
+# clones could not `npm install`. Replaced with narrow rules below.
+.claude/settings.local.json
+.vscode/settings.json
+*.tsbuildinfo
+data/
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+dist/
+build/
+.vite/
+

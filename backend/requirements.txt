@@ -1,0 +1,13 @@
+# Floors are the minimums we've tested against; upper bounds prevent a
+# rebuild from picking up a major-version release that breaks the app
+# without warning. For full reproducibility, generate a lockfile from a
+# known-good environment (e.g. ``pip freeze > requirements.lock``) and
+# install from that in CI/prod.
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.27.0,<1.0.0
+pydantic[email]>=2.6.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+sqlalchemy>=2.0.0,<3.0.0
+psycopg[binary]>=3.1.0,<4.0.0
+eth-account>=0.11.0,<1.0.0
+cryptography>=42.0.0,<46.0.0
