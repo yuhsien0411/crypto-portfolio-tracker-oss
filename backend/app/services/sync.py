@@ -348,6 +348,33 @@ def _build_coinstats_holdings(
     return out
 
 
+def _build_alchemy_holdings(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for a in assets or []:
+        amount = float(a.get("amount", 0.0) or 0.0)
+        price = float(a.get("unit_price", 0.0) or 0.0)
+        usd = float(a.get("usd_value") or amount * price)
+        if usd < _MIN_HOLDING_USD:
+            continue
+        sym = str(a.get("symbol") or "").upper() or "?"
+        chain = str(a.get("chain") or "evm").lower()
+        out.append({
+            "kind": "tok",
+            "sym": sym,
+            "name": str(a.get("name") or sym),
+            "proto": "wallet",
+            "chain": chain,
+            "amt": _fmt_amount(amount),
+            "price": _fmt_price(price),
+            "usd": round(usd, 2),
+            "d": 0.0,
+            "c": _color_for(f"{chain}:{sym}"),
+            "logo": str(a.get("logo_url") or "") or None,
+        })
+    out.sort(key=lambda h: h.get("usd", 0.0), reverse=True)
+    return out
+
+
 def _build_derive_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Render Derive options/perp positions as `kind=pos` informational rows.
     subaccount_value already includes their mark_value, so these don't
@@ -461,17 +488,18 @@ def _build_cex_holdings(
     assets: list[dict[str, Any]], exchange: str
 ) -> list[dict[str, Any]]:
     """Merge the CEX integration's per-wallet asset rows into the Holding shape
-    the UI renders. Multiple rows for the same symbol (e.g. spot + funding +
-    PM for a single coin) are summed so the UI shows one line per asset."""
-    merged: dict[str, dict[str, float]] = {}
+    the UI renders. Rows are grouped by symbol and account bucket so exchange
+    sub-accounts such as Bybit Funding/Earn remain visible in the table."""
+    merged: dict[tuple[str, str], dict[str, float]] = {}
     for a in assets or []:
         sym = str(a.get("symbol") or a.get("name") or "").upper()
         if not sym:
             continue
+        chain = str(a.get("chain") or exchange).lower()
         amount = float(a.get("amount", 0.0) or 0.0)
         price = float(a.get("unit_price", 0.0) or 0.0)
         usd = float(a.get("usd_value") or amount * price)
-        cur = merged.setdefault(sym, {"amount": 0.0, "usd": 0.0, "price": 0.0})
+        cur = merged.setdefault((sym, chain), {"amount": 0.0, "usd": 0.0, "price": 0.0})
         cur["amount"] += amount
         cur["usd"] += usd
         # Keep any positive unit price we saw — CEX rows mix priced and
@@ -479,7 +507,7 @@ def _build_cex_holdings(
         if price > 0 and cur["price"] <= 0:
             cur["price"] = price
     out: list[dict[str, Any]] = []
-    for sym, v in merged.items():
+    for (sym, chain), v in merged.items():
         amount = v["amount"]
         usd = v["usd"]
         price = v["price"] or (usd / amount if amount > 0 and usd > 0 else 0.0)
@@ -490,7 +518,7 @@ def _build_cex_holdings(
             "sym": sym,
             "name": sym,
             "proto": "—",
-            "chain": exchange,
+            "chain": chain,
             "amt": _fmt_amount(amount),
             "price": _fmt_price(price),
             "usd": round(usd, 2),
@@ -797,7 +825,21 @@ def _sync_onchain(db: Session, account: m.AccountRow) -> SyncResult:
         )
     chain = (account.chain or "").lower()
     try:
-        if chain in ("solana", "sui", "cosmos"):
+        if chain in ("solana", "sui") and (os.getenv("ALCHEMY_API_KEY") or "").strip():
+            from ..integrations.alchemy import (
+                fetch_solana_wallet_assets as fetch_alchemy_solana_wallet_assets,
+                fetch_sui_wallet_assets as fetch_alchemy_sui_wallet_assets,
+            )
+
+            fetcher = {
+                "solana": fetch_alchemy_solana_wallet_assets,
+                "sui": fetch_alchemy_sui_wallet_assets,
+            }[chain]
+            payload = fetcher(account.addr, api_key=(os.getenv("ALCHEMY_API_KEY") or "").strip())
+            new_bal = float(payload.get("balance", 0.0) or 0.0)
+            holdings = _build_coinstats_holdings(payload.get("assets") or [], chain)
+            provider = f"alchemy-{chain}-token-only"
+        elif chain in ("solana", "sui", "cosmos"):
             from ..integrations.coinstats import (
                 fetch_cosmos_wallet_assets,
                 fetch_solana_wallet_assets,
@@ -817,6 +859,23 @@ def _sync_onchain(db: Session, account: m.AccountRow) -> SyncResult:
             holdings = _build_coinstats_holdings(payload.get("assets") or [], chain)
             provider = "coinstats"
         else:
+            alchemy_key = (os.getenv("ALCHEMY_API_KEY") or "").strip()
+            if alchemy_key:
+                from ..integrations.alchemy import fetch_evm_wallet_assets
+
+                networks_raw = os.getenv("ALCHEMY_NETWORKS", "eth,polygon,bnb,arb,opt,base,mantle,scroll")
+                networks = [n.strip().lower() for n in networks_raw.split(",") if n.strip()]
+                payload = fetch_evm_wallet_assets(account.addr, alchemy_key, networks, timeout=8.0)
+                new_bal = float(payload.get("balance", 0.0) or 0.0)
+                holdings = _build_alchemy_holdings(payload.get("assets") or [])
+                provider = "alchemy-token-only"
+                _persist_snapshot(db, account, new_bal, provider, holdings=holdings)
+                return _result(
+                    account,
+                    "ok",
+                    balance=account.bal,
+                    message="synced wallet tokens via Alchemy + DefiLlama prices",
+                )
             from ..integrations.debank import (
                 fetch_all_token_list,
                 fetch_complex_app_list,
@@ -931,11 +990,17 @@ def _hits_paid_api(account: m.AccountRow) -> bool:
 
     Only onchain sources do. Exchange syncs call CEX APIs directly with the
     user's own keys; custom rows and mock/truncated addresses short-circuit
-    inside ``_sync_dispatch`` and never make a request. Used purely for the
-    preflight estimate shown in the sync-all confirmation dialog."""
+    inside ``_sync_dispatch`` and never make a request. Alchemy token-only
+    mode is not counted as a paid DeBank/CoinStats API for the confirmation
+    dialog."""
     if account.source != "onchain":
         return False
     if _is_mock_address(account.addr):
+        return False
+    chain = (account.chain or "").lower()
+    if chain in ("solana", "sui") and (os.getenv("ALCHEMY_API_KEY") or "").strip():
+        return False
+    if chain not in ("solana", "sui", "cosmos") and (os.getenv("ALCHEMY_API_KEY") or "").strip():
         return False
     return True
 
@@ -1010,6 +1075,18 @@ def validate_account(
 def _validate_onchain(account: m.AccountRow) -> None:
     chain = (account.chain or "").lower()
     try:
+        if chain in ("solana", "sui") and (os.getenv("ALCHEMY_API_KEY") or "").strip():
+            from ..integrations.alchemy import (
+                fetch_solana_wallet_assets as fetch_alchemy_solana_wallet_assets,
+                fetch_sui_wallet_assets as fetch_alchemy_sui_wallet_assets,
+            )
+
+            fetcher = {
+                "solana": fetch_alchemy_solana_wallet_assets,
+                "sui": fetch_alchemy_sui_wallet_assets,
+            }[chain]
+            fetcher(account.addr, api_key=(os.getenv("ALCHEMY_API_KEY") or "").strip())
+            return
         if chain in ("solana", "sui", "cosmos"):
             from ..integrations.coinstats import (
                 fetch_cosmos_wallet_assets,
@@ -1027,11 +1104,20 @@ def _validate_onchain(account: m.AccountRow) -> None:
             }[chain]
             fetcher(account.addr, api_key=api_key)
         else:
+            alchemy_key = (os.getenv("ALCHEMY_API_KEY") or "").strip()
+            if alchemy_key:
+                from ..integrations.alchemy import fetch_evm_wallet_assets
+
+                networks_raw = os.getenv("ALCHEMY_NETWORKS", "eth,polygon,bnb,arb,opt,base,mantle,scroll")
+                networks = [n.strip().lower() for n in networks_raw.split(",") if n.strip()]
+                fetch_evm_wallet_assets(account.addr, alchemy_key, networks, timeout=8.0)
+                return
+
             from ..integrations.debank import fetch_total_balance
 
             access_key = (os.getenv("DEBANK_ACCESS_KEY") or "").strip()
             if not access_key:
-                raise ValidationFailed("Server missing DEBANK_ACCESS_KEY")
+                raise ValidationFailed("Server missing ALCHEMY_API_KEY or DEBANK_ACCESS_KEY")
             fetch_total_balance(account.addr, access_key)
     except ValidationFailed:
         raise

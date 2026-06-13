@@ -32,6 +32,7 @@ const EXCHANGES: ExchangeDef[] = [
   { id: "binance", label: "Binance", fields: ["api_key", "api_secret"] },
   { id: "gate", label: "Gate", fields: ["api_key", "api_secret"] },
   { id: "bitget", label: "Bitget", fields: ["api_key", "api_secret", "passphrase"] },
+  { id: "bybit", label: "Bybit", fields: ["api_key", "api_secret"] },
   { id: "okx", label: "OKX", fields: ["api_key", "api_secret", "passphrase"] },
   { id: "extended", label: "Extended", fields: ["api_key"] },
   { id: "hyperliquid", label: "Hyperliquid", fields: ["wallet_address"] },

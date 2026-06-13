@@ -45,20 +45,45 @@ At minimum set `SECRETS_KEY` (used to encrypt stored credentials). Generate one:
 python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
 ```
 
-Add `DEBANK_ACCESS_KEY` / `COINSTATS_API_KEY` / `COINMARKETCAP_API_KEY` for the
-data sources you use. See [.env.example](.env.example) for everything else.
+Add provider keys for the data sources you use:
+
+- `ALCHEMY_API_KEY` for free/low-cost EVM wallet token balances and Solana
+  wallet token balances, priced via DefiLlama. This is token-only and does not
+  include DeFi positions.
+- `DEBANK_ACCESS_KEY` for EVM wallet tokens plus DeFi positions.
+- `COINSTATS_API_KEY` for Solana / Sui / Cosmos wallets.
+- `COINMARKETCAP_API_KEY` for custom assets that use live prices.
+
+When both `ALCHEMY_API_KEY` and `DEBANK_ACCESS_KEY` are set, EVM on-chain
+accounts use Alchemy token-only mode first. Solana accounts also use Alchemy
+when `ALCHEMY_API_KEY` is set, falling back to CoinStats otherwise. Set
+`ALCHEMY_NETWORKS` to choose which EVM chains to scan; default is
+`eth,polygon,bnb,arb,opt,base,mantle,scroll`.
+For very noisy wallets, tune `ALCHEMY_MAX_TOKENS_PER_NETWORK` (default `25`)
+and `ALCHEMY_METADATA_TIMEOUT_SECONDS` (default `3`) to keep syncs responsive.
 
 SQLite data is persisted to `./data` (mounted into the backend container).
 
 ## Local development
 
 ```bash
-# Backend
+# Backend (macOS/Linux)
 cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 SECRETS_KEY=$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())') \
 SESSION_COOKIE_SECURE=false \
+uvicorn app.main:app --reload          # http://localhost:8000
+```
+
+```powershell
+# Backend (Windows PowerShell)
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+$env:SECRETS_KEY = python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+$env:SESSION_COOKIE_SECURE = "false"
 uvicorn app.main:app --reload          # http://localhost:8000
 ```
 

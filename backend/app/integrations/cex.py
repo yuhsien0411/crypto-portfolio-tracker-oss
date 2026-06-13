@@ -180,12 +180,18 @@ def _is_stable_asset(asset: str) -> bool:
         "USD",
         "USD1",
         "USDT",
+        "USDT0",
         "USDC",
+        "USDE",
+        "SUSDE",
+        "USDD",
+        "USDP",
         "FDUSD",
         "BUSD",
         "TUSD",
         "USDS",
         "DAI",
+        "PYUSD",
         "BFUSD",
         "RWUSD",
     }
@@ -1144,12 +1150,19 @@ def _bybit_sign(secret: str, timestamp: str, api_key: str, recv_window: str, que
     ).hexdigest()
 
 
-def fetch_bybit_assets(wallet: dict[str, Any]) -> dict[str, Any]:
-    creds = _load_cex_credentials(wallet)
+def _bybit_request(
+    creds: dict[str, str],
+    request_path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    allow_failure: bool = False,
+) -> tuple[Any | None, str | None]:
+    params = params or {}
     timestamp = str(_now_ms())
     recv_window = "5000"
-    request_path = "/v5/account/wallet-balance"
-    query_string = urllib.parse.urlencode({"accountType": "UNIFIED"})
+    query_string = urllib.parse.urlencode(
+        [(key, value) for key, value in params.items() if value is not None]
+    )
     headers = {
         "X-BAPI-API-KEY": creds["api_key"],
         "X-BAPI-TIMESTAMP": timestamp,
@@ -1159,40 +1172,326 @@ def fetch_bybit_assets(wallet: dict[str, Any]) -> dict[str, Any]:
         ),
         "Content-Type": "application/json",
     }
-    payload = _request_json(
-        f"https://api.bybit.com{request_path}",
-        headers=headers,
+    try:
+        payload = _request_json(
+            f"https://api.bybit.com{request_path}",
+            headers=headers,
+            params=params,
+        )
+        if isinstance(payload, dict) and _to_float(payload.get("retCode")) != 0:
+            message = str(payload.get("retMsg") or payload.get("retCode") or "unknown error")
+            raise RuntimeError(f"Bybit API error on {request_path}: {message}")
+        return payload, None
+    except Exception as exc:  # noqa: BLE001
+        if allow_failure:
+            return None, str(exc)
+        raise
+
+
+def _fetch_bybit_public_prices(symbols: list[str]) -> dict[str, float]:
+    wanted = {symbol.strip().upper() for symbol in symbols if symbol}
+    wanted = {symbol for symbol in wanted if symbol and not _is_stable_asset(symbol)}
+    if not wanted:
+        return {}
+    prices: dict[str, float] = {}
+    for category in ("spot", "linear"):
+        try:
+            payload = _request_json(
+                "https://api.bybit.com/v5/market/tickers",
+                params={"category": category},
+                timeout=12.0,
+            )
+        except Exception:
+            continue
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        rows = result.get("list", []) if isinstance(result, dict) else []
+        if not isinstance(rows, list):
+            continue
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            pair = str(item.get("symbol", "") or "").strip().upper()
+            base = ""
+            for quote in ("USDT", "USDC", "USD"):
+                if pair.endswith(quote) and len(pair) > len(quote):
+                    base = pair[:-len(quote)]
+                    break
+            if base not in wanted or base in prices:
+                continue
+            price = _to_float(item.get("lastPrice") or item.get("markPrice") or item.get("indexPrice"))
+            if price > 0:
+                prices[base] = price
+    return prices
+
+
+def _bybit_price_index(symbols: list[str]) -> dict[str, float]:
+    symbols = sorted({symbol.strip().upper() for symbol in symbols if symbol})
+    prices: dict[str, float] = {
+        symbol: 1.0 for symbol in symbols if _is_stable_asset(symbol)
+    }
+    lookup_symbols: list[str] = []
+    for symbol in symbols:
+        lookup_symbols.extend(_symbol_candidates(symbol))
+    binance_prices = _fetch_binance_prices(lookup_symbols)
+    for symbol in symbols:
+        if symbol in prices:
+            continue
+        for candidate in _symbol_candidates(symbol):
+            price = binance_prices.get(candidate)
+            if price and price > 0:
+                prices[symbol] = price
+                break
+    bybit_prices = _fetch_bybit_public_prices([
+        symbol for symbol in symbols if symbol not in prices
+    ])
+    for symbol, price in bybit_prices.items():
+        if price > 0:
+            prices[symbol] = price
+    return prices
+
+
+def _bybit_asset_row(
+    symbol: str,
+    chain: str,
+    amount: float,
+    *,
+    available: float = 0.0,
+    locked: float = 0.0,
+    unit_price: float = 0.0,
+    usd_value: float = 0.0,
+) -> dict[str, Any] | None:
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return None
+    if usd_value <= 0 and unit_price > 0:
+        usd_value = amount * unit_price
+    if unit_price <= 0 and amount > 0 and usd_value > 0:
+        unit_price = usd_value / amount
+    if amount <= 0 and usd_value <= 0:
+        return None
+    return {
+        "name": symbol,
+        "symbol": symbol,
+        "chain": chain,
+        "amount": amount,
+        "available": available,
+        "locked": locked,
+        "unit_price": unit_price,
+        "usd_value": usd_value,
+    }
+
+
+def _fetch_bybit_unified_assets(
+    creds: dict[str, str],
+) -> tuple[float, list[dict[str, Any]], str]:
+    payload, _ = _bybit_request(
+        creds,
+        "/v5/account/wallet-balance",
         params={"accountType": "UNIFIED"},
     )
     result = payload.get("result", {}) if isinstance(payload, dict) else {}
     account_list = result.get("list", []) if isinstance(result, dict) else []
     account = account_list[0] if account_list and isinstance(account_list[0], dict) else {}
     raw_assets = account.get("coin", []) if isinstance(account, dict) else []
-    total_usd = float(account.get("totalEquity", 0.0) or 0.0)
-    assets = []
+    total_usd = _to_float(account.get("totalEquity"))
+    symbols = [
+        str(item.get("coin", "") or "").strip().upper()
+        for item in raw_assets
+        if isinstance(item, dict)
+    ]
+    prices = _bybit_price_index(symbols)
+    assets: list[dict[str, Any]] = []
     for item in raw_assets:
         if not isinstance(item, dict):
             continue
-        amount = float(item.get("equity", item.get("walletBalance", 0.0)) or 0.0)
-        usd_value = float(item.get("usdValue", 0.0) or 0.0)
-        if amount <= 0 and usd_value <= 0:
-            continue
-        assets.append(
-            {
-                "name": str(item.get("coin", "") or "").upper(),
-                "symbol": str(item.get("coin", "") or "").upper(),
-                "chain": "bybit",
-                "amount": amount,
-                "available": float(item.get("walletBalance", 0.0) or 0.0),
-                "locked": float(item.get("locked", 0.0) or 0.0),
-                "unit_price": usd_value / amount if amount > 0 else 0.0,
-                "usd_value": usd_value,
-            }
+        symbol = str(item.get("coin", "") or "").strip().upper()
+        amount = _to_float(item.get("equity", item.get("walletBalance", 0.0)))
+        row = _bybit_asset_row(
+            symbol,
+            "bybit",
+            amount,
+            available=_to_float(item.get("walletBalance")),
+            locked=_to_float(item.get("locked")),
+            unit_price=prices.get(symbol, 0.0),
+            usd_value=_to_float(item.get("usdValue")),
         )
+        if row:
+            assets.append(row)
+    return total_usd, assets, "bybit /v5/account/wallet-balance?accountType=UNIFIED"
+
+
+def _fetch_bybit_funding_assets(
+    creds: dict[str, str],
+) -> tuple[float, list[dict[str, Any]], str | None, str | None]:
+    strategy = (
+        "bybit /v5/asset/transfer/query-account-coins-balance?accountType=FUND"
+        " + /query-account-coin-balance?accountType=FUND&coin=USD"
+    )
+    errors: list[str] = []
+    payload, error = _bybit_request(
+        creds,
+        "/v5/asset/transfer/query-account-coins-balance",
+        params={"accountType": "FUND"},
+        allow_failure=True,
+    )
+    if error:
+        errors.append(error)
+        balances = []
+    else:
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        balances = result.get("balance", []) if isinstance(result, dict) else []
+        if not isinstance(balances, list):
+            balances = []
+
+    usd_payload, usd_error = _bybit_request(
+        creds,
+        "/v5/asset/transfer/query-account-coin-balance",
+        params={"accountType": "FUND", "coin": "USD"},
+        allow_failure=True,
+    )
+    if usd_error:
+        errors.append(usd_error)
+    else:
+        usd_result = usd_payload.get("result", {}) if isinstance(usd_payload, dict) else {}
+        usd_balance = usd_result.get("balance") if isinstance(usd_result, dict) else None
+        if isinstance(usd_balance, dict):
+            existing_usd = any(
+                isinstance(item, dict)
+                and str(item.get("coin", "") or "").strip().upper() == "USD"
+                for item in balances
+            )
+            if not existing_usd:
+                balances.append(usd_balance)
+
+    if not balances:
+        return 0.0, [], None, "; ".join(errors) if errors else None
+    symbols = [
+        str(item.get("coin", "") or "").strip().upper()
+        for item in balances
+        if isinstance(item, dict)
+    ]
+    prices = _bybit_price_index(symbols)
+    total_usd = 0.0
+    assets: list[dict[str, Any]] = []
+    for item in balances if isinstance(balances, list) else []:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("coin", "") or "").strip().upper()
+        amount = _to_float(item.get("walletBalance"))
+        if amount <= 0:
+            continue
+        unit_price = prices.get(symbol, 0.0)
+        row = _bybit_asset_row(
+            symbol,
+            "bybit-funding",
+            amount,
+            available=_to_float(item.get("transferBalance")),
+            unit_price=unit_price,
+        )
+        if row:
+            total_usd += float(row.get("usd_value") or 0.0)
+            assets.append(row)
+    return (
+        total_usd,
+        assets,
+        strategy,
+        "; ".join(errors) if errors else None,
+    )
+
+
+def _fetch_bybit_earn_assets(
+    creds: dict[str, str],
+) -> tuple[float, list[dict[str, Any]], list[str], list[str]]:
+    strategies: list[str] = []
+    errors: list[str] = []
+    raw_rows: list[tuple[str, str, float]] = []
+    earn_specs = (
+        (
+            "/v5/earn/position",
+            {"category": "FlexibleSaving"},
+            "bybit-earn-flexible",
+            "bybit /v5/earn/position?category=FlexibleSaving",
+        ),
+        (
+            "/v5/earn/position",
+            {"category": "OnChain"},
+            "bybit-earn-onchain",
+            "bybit /v5/earn/position?category=OnChain",
+        ),
+        (
+            "/v5/earn/fixed-term/position",
+            {},
+            "bybit-earn-fixed",
+            "bybit /v5/earn/fixed-term/position",
+        ),
+    )
+    for path, params, chain, strategy in earn_specs:
+        payload, error = _bybit_request(
+            creds,
+            path,
+            params=params,
+            allow_failure=True,
+        )
+        if error:
+            errors.append(error)
+            continue
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        rows = result.get("list", []) if isinstance(result, dict) else []
+        if not isinstance(rows, list):
+            continue
+        strategies.append(strategy)
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("coin", "") or "").strip().upper()
+            amount = _to_float(item.get("amount"))
+            if amount <= 0:
+                continue
+            raw_rows.append((symbol, chain, amount))
+
+    prices = _bybit_price_index([symbol for symbol, _, _ in raw_rows])
+    total_usd = 0.0
+    assets: list[dict[str, Any]] = []
+    for symbol, chain, amount in raw_rows:
+        row = _bybit_asset_row(
+            symbol,
+            chain,
+            amount,
+            locked=amount,
+            unit_price=prices.get(symbol, 0.0),
+        )
+        if row:
+            total_usd += float(row.get("usd_value") or 0.0)
+            assets.append(row)
+    return total_usd, assets, strategies, errors
+
+
+def fetch_bybit_assets(wallet: dict[str, Any]) -> dict[str, Any]:
+    creds = _load_cex_credentials(wallet)
+    errors: list[str] = []
+    strategies: list[str] = []
+    total_usd, assets, unified_strategy = _fetch_bybit_unified_assets(creds)
+    strategies.append(unified_strategy)
+
+    funding_total, funding_assets, funding_strategy, funding_error = _fetch_bybit_funding_assets(creds)
+    total_usd += funding_total
+    assets.extend(funding_assets)
+    if funding_strategy:
+        strategies.append(funding_strategy)
+    if funding_error:
+        errors.append(funding_error)
+
+    earn_total, earn_assets, earn_strategies, earn_errors = _fetch_bybit_earn_assets(creds)
+    total_usd += earn_total
+    assets.extend(earn_assets)
+    strategies.extend(earn_strategies)
+    errors.extend(earn_errors)
+
     return {
         "balance": total_usd,
         "assets": assets,
-        "fetch_strategy": f"bybit /v5/account/wallet-balance via {creds['prefix']}_*",
+        "fetch_strategy": f"{' + '.join(strategies)} via {creds['prefix']}_*",
+        "errors": errors,
     }
 
 
