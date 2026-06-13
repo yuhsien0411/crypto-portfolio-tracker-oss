@@ -38,3 +38,5 @@ dist/
 **/dist/
 build/
 .vite/
+
+scripts/

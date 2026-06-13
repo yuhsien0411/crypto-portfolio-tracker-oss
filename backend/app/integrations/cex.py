@@ -1399,6 +1399,47 @@ def _fetch_bybit_funding_assets(
     )
 
 
+def _fetch_bybit_fiat_assets(
+    creds: dict[str, str],
+) -> tuple[float, list[dict[str, Any]], str | None, str | None]:
+    strategy = "bybit /v5/fiat/balance-query"
+    payload, error = _bybit_request(
+        creds,
+        "/v5/fiat/balance-query",
+        allow_failure=True,
+    )
+    if error:
+        print("error", error)
+        return 0.0, [], None, error
+    print(payload)
+    result = payload.get("result", []) if isinstance(payload, dict) else []
+    rows = result if isinstance(result, list) else [result]
+    total_usd = 0.0
+    assets: list[dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        currency = str(item.get("currency", "") or "").strip().upper()
+        if not currency:
+            continue
+        amount = _to_float(item.get("totalBalance"))
+        available = _to_float(item.get("balance"))
+        frozen = _to_float(item.get("frozenBalance"))
+        unit_price = 1.0 if currency == "USD" else 0.0
+        row = _bybit_asset_row(
+            currency,
+            "bybit-fiat",
+            amount,
+            available=available,
+            locked=frozen,
+            unit_price=unit_price,
+        )
+        if row:
+            total_usd += float(row.get("usd_value") or 0.0)
+            assets.append(row)
+    return total_usd, assets, strategy if assets else None, None
+
+
 def _fetch_bybit_earn_assets(
     creds: dict[str, str],
 ) -> tuple[float, list[dict[str, Any]], list[str], list[str]]:
@@ -1480,6 +1521,33 @@ def fetch_bybit_assets(wallet: dict[str, Any]) -> dict[str, Any]:
         strategies.append(funding_strategy)
     if funding_error:
         errors.append(funding_error)
+
+    fiat_total, fiat_assets, fiat_strategy, fiat_error = _fetch_bybit_fiat_assets(creds)
+    if fiat_assets:
+        fiat_symbols = {
+            str(item.get("symbol", "") or "").strip().upper()
+            for item in fiat_assets
+        }
+        total_usd -= sum(
+            float(item.get("usd_value") or 0.0)
+            for item in assets
+            if str(item.get("symbol", "") or "").strip().upper() in fiat_symbols
+            and str(item.get("chain", "") or "") == "bybit-funding"
+        )
+        assets = [
+            item
+            for item in assets
+            if not (
+                str(item.get("symbol", "") or "").strip().upper() in fiat_symbols
+                and str(item.get("chain", "") or "") == "bybit-funding"
+            )
+        ]
+        total_usd += fiat_total
+        assets.extend(fiat_assets)
+    if fiat_strategy:
+        strategies.append(fiat_strategy)
+    if fiat_error:
+        errors.append(fiat_error)
 
     earn_total, earn_assets, earn_strategies, earn_errors = _fetch_bybit_earn_assets(creds)
     total_usd += earn_total
