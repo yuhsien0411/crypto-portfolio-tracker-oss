@@ -60,7 +60,7 @@ An old taxonomy (`chain` / `cex` / `perp` / `manual`) is rewritten in place by `
 
 ### Credentials split
 
-- **Global env** (`.env` at repo root): `SECRETS_KEY` (encrypts stored credentials), `ALCHEMY_API_KEY`, `COINMARKETCAP_API_KEY`. Loaded by `main.py` via `load_dotenv(find_dotenv(usecwd=True))`; Docker Compose injects the same vars via `env_file`.
+- **Global env** (`.env` at repo root): `SECRETS_KEY` (encrypts stored credentials) and `ALCHEMY_API_KEY`. Custom live prices use DefiLlama first, then DexScreener fallback, with no API key. Loaded by `main.py` via `load_dotenv(find_dotenv(usecwd=True))`; Docker Compose injects the same vars via `env_file`.
 - **Per-account** (DB `cex_credentials` table): `api_key`, `api_secret`, `passphrase`, `wallet_address`, `private_key`. Entered through the UI; the secret columns are encrypted at rest (`crypto.py` / `EncryptedString`), and the `credentials` router only exposes `has_*` booleans.
 
 ### Snapshots & history

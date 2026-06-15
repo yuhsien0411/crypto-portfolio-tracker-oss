@@ -1,4 +1,4 @@
-"""Alchemy token-only wallet clients with DefiLlama prices."""
+"""Alchemy token-only wallet clients with DefiLlama/DexScreener prices."""
 from __future__ import annotations
 
 import json
@@ -149,10 +149,26 @@ ALCHEMY_NETWORKS: dict[str, dict[str, str]] = {
 }
 
 DEFILLAMA_PRICES_URL = "https://coins.llama.fi/prices/current/{coins}"
+DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/tokens/v1/{chain_id}/{addresses}"
 SOLANA_URL = "https://solana-mainnet.g.alchemy.com/v2/{api_key}"
 SUI_URL = "https://sui-mainnet.g.alchemy.com/v2/{api_key}"
 SUI_NATIVE_COIN_TYPE = "0x2::sui::SUI"
 ERC20_BALANCE_OF_SELECTOR = "0x70a08231"
+SOLANA_TOKEN_PROGRAMS = {
+    "spl-token": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "token-2022": "TokenzQdBNbLqP5VEhdkAS6EPFLCB9yJnWkL3KzVxk",
+}
+
+DEXSCREENER_CHAIN_IDS = {
+    "eth": "ethereum",
+    "polygon": "polygon",
+    "bnb": "bsc",
+    "arb": "arbitrum",
+    "base": "base",
+    "mantle": "mantle",
+    "scroll": "scroll",
+    "solana": "solana",
+}
 
 
 def _rpc(url: str, method: str, params: list[Any], timeout: float) -> Any:
@@ -210,7 +226,10 @@ def _price_map(price_ids: list[str], timeout: float) -> dict[str, float]:
         encoded = urllib.parse.quote(",".join(chunk), safe=",:")
         request = urllib.request.Request(
             DEFILLAMA_PRICES_URL.format(coins=encoded),
-            headers={"accept": "application/json"},
+            headers={
+                "accept": "application/json",
+                "user-agent": "crypto-portfolio-tracker/1.0",
+            },
             method="GET",
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -221,6 +240,94 @@ def _price_map(price_ids: list[str], timeout: float) -> dict[str, float]:
         for key, item in coins.items():
             if isinstance(item, dict) and item.get("price") is not None:
                 prices[key] = float(item["price"])
+    return prices
+
+
+def _to_positive_float(value: Any) -> float:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return price if price > 0 else 0.0
+
+
+def _pair_liquidity_usd(pair: dict[str, Any]) -> float:
+    liquidity = pair.get("liquidity")
+    if not isinstance(liquidity, dict):
+        return 0.0
+    return _to_positive_float(liquidity.get("usd"))
+
+
+def _dexscreener_price(asset: dict[str, Any], timeout: float) -> float:
+    address = str(asset.get("contract_address") or "").strip()
+    chain = str(asset.get("chain") or "").strip().lower()
+    chain_id = DEXSCREENER_CHAIN_IDS.get(chain)
+    if not address or not chain_id:
+        return 0.0
+
+    request = urllib.request.Request(
+        DEXSCREENER_TOKENS_URL.format(
+            chain_id=urllib.parse.quote(chain_id, safe=""),
+            addresses=urllib.parse.quote(address, safe=","),
+        ),
+        headers={
+            "accept": "application/json",
+            "user-agent": "crypto-portfolio-tracker/1.0",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    pairs = payload
+    if isinstance(payload, dict):
+        pairs = payload.get("pairs")
+    if not isinstance(pairs, list):
+        return 0.0
+
+    candidates: list[dict[str, Any]] = []
+    wanted = address.lower()
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        if str(pair.get("chainId") or "").lower() != chain_id:
+            continue
+        base_token = pair.get("baseToken")
+        if not isinstance(base_token, dict):
+            continue
+        if str(base_token.get("address") or "").lower() != wanted:
+            continue
+        if _to_positive_float(pair.get("priceUsd")) <= 0:
+            continue
+        candidates.append(pair)
+    if not candidates:
+        return 0.0
+    best = max(candidates, key=_pair_liquidity_usd)
+    return _to_positive_float(best.get("priceUsd"))
+
+
+def _dexscreener_price_map(assets: list[dict[str, Any]], timeout: float) -> dict[str, float]:
+    prices: dict[str, float] = {}
+    seen: set[tuple[str, str]] = set()
+    for asset in assets:
+        price_id = str(asset.get("price_id") or "")
+        chain = str(asset.get("chain") or "").lower()
+        address = str(asset.get("contract_address") or "").lower()
+        key = (chain, address)
+        if not price_id or not address or key in seen:
+            continue
+        seen.add(key)
+        try:
+            price = _dexscreener_price(asset, timeout)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "alchemy: DexScreener price lookup failed for %s %s: %s",
+                chain,
+                address,
+                exc,
+            )
+            continue
+        if price > 0:
+            prices[price_id] = price
     return prices
 
 
@@ -276,10 +383,54 @@ def _sui_rpc(url: str, method: str, params: list[Any], timeout: float) -> Any:
     return payload.get("result") if isinstance(payload, dict) else None
 
 
+def _token_amount_to_float(token_amount: dict[str, Any]) -> float:
+    raw_ui = token_amount.get("uiAmountString")
+    if raw_ui is not None:
+        try:
+            return float(str(raw_ui))
+        except ValueError:
+            return 0.0
+    try:
+        return float(token_amount.get("uiAmount") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _sui_price_id(coin_type: str) -> str:
     if coin_type == SUI_NATIVE_COIN_TYPE:
         return "coingecko:sui"
     return f"sui:{coin_type}"
+
+
+def _asset_token_key(asset: dict[str, Any]) -> str:
+    chain = str(asset.get("chain") or "").strip().lower()
+    contract = str(asset.get("contract_address") or "").strip().lower()
+    if chain and contract:
+        return f"tok:{chain}:{contract}"
+    symbol = str(asset.get("symbol") or "").strip().upper()
+    if chain and symbol:
+        return f"tok:{chain}:native:{symbol}"
+    return ""
+
+
+def _filter_excluded_assets(
+    assets: list[dict[str, Any]],
+    excluded_token_keys: list[str] | None,
+) -> list[dict[str, Any]]:
+    excluded = {
+        str(key).strip().lower()
+        for key in (excluded_token_keys or [])
+        if str(key).strip()
+    }
+    out: list[dict[str, Any]] = []
+    for asset in assets:
+        token_key = _asset_token_key(asset)
+        if token_key:
+            asset["token_key"] = token_key
+        if token_key and token_key in excluded:
+            continue
+        out.append(asset)
+    return out
 
 
 def _fetch_network_assets(
@@ -287,13 +438,24 @@ def _fetch_network_assets(
     api_key: str,
     network_id: str,
     timeout: float,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     cfg = ALCHEMY_NETWORKS[network_id]
     url = cfg["url"].format(api_key=api_key)
     assets: list[dict[str, Any]] = []
+    status: dict[str, Any] = {
+        "network": network_id,
+        "status": "ok",
+        "assets": 0,
+        "native": False,
+        "known_tokens": 0,
+        "generic_tokens": 0,
+        "metadata_calls": 0,
+        "warnings": [],
+    }
 
     native_raw = _hex_to_int(_rpc(url, "eth_getBalance", [address, "latest"], timeout))
     if native_raw > 0:
+        status["native"] = True
         assets.append({
             "symbol": cfg["native_symbol"],
             "name": cfg["native_name"],
@@ -323,6 +485,7 @@ def _fetch_network_assets(
         if amount <= 0:
             continue
         seen_contracts.add(contract)
+        status["known_tokens"] += 1
         assets.append({
             "symbol": str(meta.get("symbol") or contract[:8]).upper(),
             "name": str(meta.get("name") or meta.get("symbol") or contract),
@@ -335,15 +498,21 @@ def _fetch_network_assets(
     try:
         result = _rpc(url, "alchemy_getTokenBalances", [address, "erc20"], timeout)
     except Exception as exc:  # noqa: BLE001
+        status["status"] = "partial" if assets else "warning"
+        status["warnings"].append(f"generic token scan failed: {exc}")
         _log.warning(
             "alchemy: skipping generic %s token scan after failure: %s",
             network_id,
             exc,
         )
-        return assets
+        status["assets"] = len(assets)
+        return assets, status
     balances = result.get("tokenBalances") if isinstance(result, dict) else []
     if not isinstance(balances, list):
-        return assets
+        status["status"] = "partial" if assets else "warning"
+        status["warnings"].append("generic token scan returned no tokenBalances list")
+        status["assets"] = len(assets)
+        return assets, status
 
     balances = sorted(
         balances,
@@ -352,7 +521,7 @@ def _fetch_network_assets(
         and str(row.get("contractAddress") or "").lower() in known_meta
         else 1,
     )
-    max_tokens = int(os.getenv("ALCHEMY_MAX_TOKENS_PER_NETWORK", "25"))
+    max_tokens = int(os.getenv("ALCHEMY_MAX_TOKENS_PER_NETWORK", "100"))
     metadata_timeout = float(os.getenv("ALCHEMY_METADATA_TIMEOUT_SECONDS", "3"))
     metadata_count = 0
     for row in balances:
@@ -367,6 +536,8 @@ def _fetch_network_assets(
         meta = known_meta.get(contract)
         if meta is None:
             if metadata_count >= max_tokens:
+                status["status"] = "partial"
+                status["warnings"].append(f"metadata limit reached: {max_tokens}")
                 _log.info(
                     "alchemy: %s token metadata limit reached (%s)",
                     network_id,
@@ -376,6 +547,7 @@ def _fetch_network_assets(
             try:
                 meta = _rpc(url, "alchemy_getTokenMetadata", [contract], metadata_timeout)
             except Exception as exc:  # noqa: BLE001
+                status["warnings"].append(f"metadata failed for {contract}: {exc}")
                 _log.warning(
                     "alchemy: skipping %s token %s after metadata failure: %s",
                     network_id,
@@ -384,6 +556,7 @@ def _fetch_network_assets(
                 )
                 continue
             metadata_count += 1
+            status["metadata_calls"] = metadata_count
         if not isinstance(meta, dict):
             continue
         decimals = meta.get("decimals")
@@ -395,6 +568,7 @@ def _fetch_network_assets(
         if amount <= 0:
             continue
         llama_chain = cfg["llama"]
+        status["generic_tokens"] += 1
         assets.append({
             "symbol": str(meta.get("symbol") or contract[:8]).upper(),
             "name": str(meta.get("name") or meta.get("symbol") or contract),
@@ -404,7 +578,10 @@ def _fetch_network_assets(
             "price_id": f"{llama_chain}:{contract}",
             "logo_url": str(meta.get("logo") or "") or None,
         })
-    return assets
+    status["assets"] = len(assets)
+    if status["warnings"] and status["status"] == "ok":
+        status["status"] = "partial"
+    return assets, status
 
 
 def fetch_evm_wallet_assets(
@@ -412,6 +589,7 @@ def fetch_evm_wallet_assets(
     api_key: str,
     networks: list[str],
     timeout: float = 8.0,
+    excluded_token_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     normalized = str(address or "").strip()
     if not normalized:
@@ -421,19 +599,47 @@ def fetch_evm_wallet_assets(
         raise ValueError("Alchemy API key is required.")
 
     assets: list[dict[str, Any]] = []
+    network_statuses: list[dict[str, Any]] = []
     for network_id in networks:
         if network_id not in ALCHEMY_NETWORKS:
+            network_statuses.append({
+                "network": network_id,
+                "status": "skipped",
+                "assets": 0,
+                "warnings": ["unsupported Alchemy network"],
+            })
             continue
         try:
-            assets.extend(_fetch_network_assets(normalized, resolved_key, network_id, timeout))
+            network_assets, network_status = _fetch_network_assets(
+                normalized,
+                resolved_key,
+                network_id,
+                timeout,
+            )
+            assets.extend(network_assets)
+            network_statuses.append(network_status)
         except Exception as exc:  # noqa: BLE001
+            network_statuses.append({
+                "network": network_id,
+                "status": "error",
+                "assets": 0,
+                "warnings": [str(exc)],
+            })
             _log.warning("alchemy: skipping %s after fetch failure: %s", network_id, exc)
 
+    assets = _filter_excluded_assets(assets, excluded_token_keys)
     try:
         prices = _price_map([str(a.get("price_id") or "") for a in assets], timeout)
     except Exception as exc:  # noqa: BLE001
         _log.warning("alchemy: price lookup failed: %s", exc)
         prices = {}
+    missing_price_assets = [
+        a for a in assets
+        if prices.get(str(a.get("price_id") or ""), 0.0) <= 0
+        and str(a.get("contract_address") or "")
+    ]
+    if missing_price_assets:
+        prices.update(_dexscreener_price_map(missing_price_assets, timeout))
     total = 0.0
     for asset in assets:
         price = _fallback_price(asset, prices)
@@ -442,13 +648,19 @@ def fetch_evm_wallet_assets(
         asset["unit_price"] = price
         asset["usd_value"] = usd
         total += usd
-    return {"address": normalized, "balance": total, "assets": assets}
+    return {
+        "address": normalized,
+        "balance": total,
+        "assets": assets,
+        "network_statuses": network_statuses,
+    }
 
 
 def fetch_solana_wallet_assets(
     address: str,
     api_key: str,
     timeout: float = 30.0,
+    excluded_token_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     normalized = str(address or "").strip()
     if not normalized:
@@ -459,12 +671,22 @@ def fetch_solana_wallet_assets(
 
     url = SOLANA_URL.format(api_key=resolved_key)
     assets: list[dict[str, Any]] = []
+    status: dict[str, Any] = {
+        "network": "solana",
+        "status": "ok",
+        "assets": 0,
+        "native": False,
+        "token_accounts": 0,
+        "warnings": [],
+    }
+    seen_mints: set[str] = set()
 
     sol_balance = _solana_rpc(url, "getBalance", [normalized], timeout)
     lamports = 0
     if isinstance(sol_balance, dict):
         lamports = int(sol_balance.get("value") or 0)
     if lamports > 0:
+        status["native"] = True
         assets.append({
             "symbol": "SOL",
             "name": "Solana",
@@ -474,29 +696,47 @@ def fetch_solana_wallet_assets(
             "price_id": "coingecko:solana",
         })
 
-    token_accounts = _solana_rpc(
-        url,
-        "getTokenAccountsByOwner",
-        [
-            normalized,
-            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-            {"encoding": "jsonParsed"},
-        ],
-        timeout,
-    )
-    rows = token_accounts.get("value") if isinstance(token_accounts, dict) else []
-    if isinstance(rows, list):
+    for program_label, program_id in SOLANA_TOKEN_PROGRAMS.items():
+        try:
+            token_accounts = _solana_rpc(
+                url,
+                "getTokenAccountsByOwner",
+                [
+                    normalized,
+                    {"programId": program_id},
+                    {"encoding": "jsonParsed"},
+                ],
+                timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            status["status"] = "partial" if assets else "warning"
+            status["warnings"].append(f"{program_label} scan failed: {exc}")
+            _log.warning(
+                "alchemy: skipping Solana %s token scan after failure: %s",
+                program_label,
+                exc,
+            )
+            continue
+        rows = token_accounts.get("value") if isinstance(token_accounts, dict) else []
+        if not isinstance(rows, list):
+            status["status"] = "partial" if assets else "warning"
+            status["warnings"].append(f"{program_label} scan returned no value list")
+            continue
         for row in rows:
             try:
                 info = row["account"]["data"]["parsed"]["info"]
                 mint = str(info["mint"])
                 token_amount = info["tokenAmount"]
-                amount = float(token_amount.get("uiAmount") or 0.0)
+                amount = _token_amount_to_float(token_amount)
                 decimals = int(token_amount.get("decimals") or 0)
             except (KeyError, TypeError, ValueError):
                 continue
             if amount <= 0 or not mint:
                 continue
+            if mint in seen_mints:
+                continue
+            seen_mints.add(mint)
+            status["token_accounts"] += 1
             assets.append({
                 "symbol": mint[:6].upper(),
                 "name": mint,
@@ -507,7 +747,15 @@ def fetch_solana_wallet_assets(
                 "price_id": f"solana:{mint}",
             })
 
+    assets = _filter_excluded_assets(assets, excluded_token_keys)
     prices = _price_map([str(a.get("price_id") or "") for a in assets], timeout)
+    missing_price_assets = [
+        a for a in assets
+        if prices.get(str(a.get("price_id") or ""), 0.0) <= 0
+        and str(a.get("contract_address") or "")
+    ]
+    if missing_price_assets:
+        prices.update(_dexscreener_price_map(missing_price_assets, timeout))
     total = 0.0
     for asset in assets:
         price = _fallback_price(asset, prices)
@@ -516,13 +764,20 @@ def fetch_solana_wallet_assets(
         asset["unit_price"] = price
         asset["usd_value"] = usd
         total += usd
-    return {"address": normalized, "balance": total, "assets": assets}
+    status["assets"] = len(assets)
+    return {
+        "address": normalized,
+        "balance": total,
+        "assets": assets,
+        "network_statuses": [status],
+    }
 
 
 def fetch_sui_wallet_assets(
     address: str,
     api_key: str,
     timeout: float = 30.0,
+    excluded_token_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     normalized = str(address or "").strip()
     if not normalized:
@@ -535,7 +790,7 @@ def fetch_sui_wallet_assets(
     assets: list[dict[str, Any]] = []
     balances = _sui_rpc(url, "suix_getAllBalances", [normalized], timeout)
     if isinstance(balances, list):
-        max_tokens = int(os.getenv("ALCHEMY_MAX_TOKENS_PER_NETWORK", "25"))
+        max_tokens = int(os.getenv("ALCHEMY_MAX_TOKENS_PER_NETWORK", "100"))
         metadata_timeout = float(os.getenv("ALCHEMY_METADATA_TIMEOUT_SECONDS", "3"))
         metadata_count = 0
         for row in balances:
@@ -599,11 +854,19 @@ def fetch_sui_wallet_assets(
                 "logo_url": str(meta.get("iconUrl") or "") or None,
             })
 
+    assets = _filter_excluded_assets(assets, excluded_token_keys)
     try:
         prices = _price_map([str(a.get("price_id") or "") for a in assets], timeout)
     except Exception as exc:  # noqa: BLE001
         _log.warning("alchemy: Sui price lookup failed: %s", exc)
         prices = {}
+    missing_price_assets = [
+        a for a in assets
+        if prices.get(str(a.get("price_id") or ""), 0.0) <= 0
+        and str(a.get("contract_address") or "")
+    ]
+    if missing_price_assets:
+        prices.update(_dexscreener_price_map(missing_price_assets, timeout))
     total = 0.0
     for asset in assets:
         price = _fallback_price(asset, prices)

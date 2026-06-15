@@ -66,7 +66,7 @@ def sync_one(
     if account is None or account.user_id != user.id:
         raise HTTPException(status_code=404, detail="Account not found")
     # Plain custom accounts are local-only. Custom accounts with
-    # price_source="api" hit CoinMarketCap, so they share the sync throttle.
+    # price_source="api" hit live price providers, so they share the sync throttle.
     # Skip the throttle for an account's first sync — the "create new account"
     # flow on the frontend immediately syncs the account it just created, and
     # we want users to be able to add several accounts back-to-back.

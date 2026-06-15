@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from .. import db_models as m
 from ..auth import current_user
-from ..integrations.prices import PriceNotFound, fetch_spot_price_usd
+from ..integrations.prices import PriceNotFound, fetch_spot_quote_usd
 from .. import ratelimit
 
 router = APIRouter(prefix="/api/prices", tags=["prices"])
@@ -18,7 +18,7 @@ _SYMBOL_RE = re.compile(r"^[A-Z0-9._-]{1,16}$")
 class SpotPrice(BaseModel):
     symbol: str
     price_usd: float
-    source: str = "coinmarketcap"
+    source: str
 
 
 @router.get("/{symbol}", response_model=SpotPrice)
@@ -38,7 +38,7 @@ def get_spot_price(
             headers={"Retry-After": str(rl.retry_after_seconds)},
         )
     try:
-        price = fetch_spot_price_usd(sym)
+        quote = fetch_spot_quote_usd(sym)
     except PriceNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    return SpotPrice(symbol=sym, price_usd=price)
+    return SpotPrice(symbol=sym, price_usd=quote.price_usd, source=quote.source)

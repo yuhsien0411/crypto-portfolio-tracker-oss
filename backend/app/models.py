@@ -48,7 +48,7 @@ PriceSource = Literal["custom", "api"]
 class CustomAsset(BaseModel):
     """User-entered holding for a `custom` account. `amount` × `unit_price`
     contributes to the account balance. `price_source="api"` means the server
-    keeps ``unit_price`` in sync with CoinMarketCap on each account sync; the
+    keeps ``unit_price`` in sync with live price providers on each account sync; the
     client-supplied ``unit_price`` on an "api" asset is only used as a fallback
     if the live lookup fails."""
     symbol: str = Field(min_length=1, max_length=16, pattern=r"^[A-Za-z0-9._-]+$")
@@ -105,7 +105,7 @@ class Holding(BaseModel):
     amt_raw: Optional[float] = None
     price_raw: Optional[float] = None
     # Only present on custom-source holdings. "api" means the server refreshes
-    # this row's price from CoinMarketCap on every sync.
+    # this row's price from live price providers on every sync.
     price_source: Optional[PriceSource] = None
     # True when this row's USD has been excluded from the account/total
     # balance by the user. The row is still rendered — the UI greys it out.

@@ -17,7 +17,7 @@ hosted billing, no email provider required.
   Hyperliquid · Derive · Extended. Keys are entered in the UI and stored
   **encrypted at rest**.
 - **Custom assets** — anything off-API (cold storage, OTC, vault shares), with
-  optional live pricing from CoinMarketCap.
+  optional live pricing from DefiLlama, then DexScreener as fallback.
 - **Groups, balance history, daily auto-sync**, and a per-asset/per-account
   breakdown.
 - **Local multi-user auth** — signup/login with session cookies; passwords are
@@ -50,7 +50,8 @@ Add provider keys for the data sources you use:
 
 - `ALCHEMY_API_KEY` for EVM, Solana, and Sui wallet token balances, priced via
   DefiLlama. This is token-only and does not include DeFi positions.
-- `COINMARKETCAP_API_KEY` for custom assets that use live prices.
+- Custom assets with live prices use DefiLlama first, then DexScreener as
+  fallback; no API key is required.
 
 Set `ALCHEMY_NETWORKS` to choose which EVM chains to scan; default is
 `eth,polygon,bnb,arb,opt,base,mantle,scroll`.
@@ -93,9 +94,9 @@ Health check: `GET /api/health`. Set `ENABLE_API_DOCS=1` for `/docs`.
 
 ## How credentials work
 
-- **Global provider keys** (`.env`): `ALCHEMY_API_KEY` and
-  `COINMARKETCAP_API_KEY`. Used by the server to read public on-chain data and
-  refresh live-priced custom assets.
+- **Global provider keys** (`.env`): `ALCHEMY_API_KEY` is used by the server to
+  read public on-chain data. Live-priced custom assets use DefiLlama first,
+  then DexScreener as fallback.
 - **Per-account exchange keys** (entered in the UI): API key/secret/passphrase
   and wallet address/private key, stored encrypted in the DB with `SECRETS_KEY`.
   The API only ever returns `has_*` booleans, never the secret values.

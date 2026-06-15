@@ -41,6 +41,9 @@ def holding_key(h: dict[str, Any]) -> str:
     if kind == "pos":
         proto = str(h.get("proto") or "")
         return f"pos:{chain}:{proto}:{sym}"
+    token_key = str(h.get("token_key") or "").strip().lower()
+    if token_key:
+        return token_key
     return f"tok:{chain}:{sym}"
 
 
@@ -86,7 +89,7 @@ def _build_alchemy_holdings(assets: list[dict[str, Any]]) -> list[dict[str, Any]
         amount = float(a.get("amount", 0.0) or 0.0)
         price = float(a.get("unit_price", 0.0) or 0.0)
         usd = float(a.get("usd_value") or amount * price)
-        if usd < _MIN_HOLDING_USD:
+        if amount <= 0:
             continue
         sym = str(a.get("symbol") or "").upper() or "?"
         chain = str(a.get("chain") or "evm").lower()
@@ -96,6 +99,7 @@ def _build_alchemy_holdings(assets: list[dict[str, Any]]) -> list[dict[str, Any]
             "name": str(a.get("name") or sym),
             "proto": "wallet",
             "chain": chain,
+            "token_key": str(a.get("token_key") or "").strip().lower() or None,
             "amt": _fmt_amount(amount),
             "price": _fmt_price(price),
             "usd": round(usd, 2),
@@ -263,7 +267,7 @@ def _build_cex_holdings(
 
 
 def _live_price_or_none(symbol: str) -> float | None:
-    """Best-effort CoinMarketCap lookup. Returns ``None`` on any failure so
+    """Best-effort DefiLlama/DexScreener lookup. Returns ``None`` on any failure so
     the caller can fall back to the last-known price instead of exploding
     the whole sync."""
     from ..integrations.prices import PriceNotFound, fetch_spot_price_usd
@@ -389,7 +393,7 @@ def apply_custom_assets(
 
 def _refresh_api_priced_custom_assets(account: m.AccountRow) -> tuple[int, int]:
     """Re-price every ``price_source="api"`` row in ``account.custom_assets``
-    from CoinMarketCap, mutating the list in place. Returns
+    from DefiLlama/DexScreener, mutating the list in place. Returns
     ``(refreshed, api_total)`` so the caller can build a status message.
     Rows whose live lookup fails keep their last-known price."""
     refreshed = 0
@@ -455,7 +459,7 @@ def _cex_wallet(account: m.AccountRow, exchange: str, cred: m.CexCredentialRow) 
 
 
 def account_uses_live_prices(db: Session, account: m.AccountRow) -> bool:
-    """True when syncing this account will call CoinMarketCap. Any account
+    """True when syncing this account will call a live price provider. Any account
     with a ``price_source="api"`` custom asset triggers a live lookup,
     regardless of the account's source."""
     return any(
@@ -549,6 +553,48 @@ def _result(account: m.AccountRow, status: str, **kw: Any) -> SyncResult:
     )
 
 
+def _alchemy_status_message(statuses: list[dict[str, Any]]) -> str:
+    if not statuses:
+        return "synced wallet tokens via Alchemy + DefiLlama/DexScreener prices"
+
+    ok: list[str] = []
+    partial: list[str] = []
+    failed: list[str] = []
+    skipped: list[str] = []
+    for status in statuses:
+        network = str(status.get("network") or "?")
+        state = str(status.get("status") or "ok").lower()
+        assets = int(status.get("assets") or 0)
+        warnings = [
+            str(w)
+            for w in (status.get("warnings") or [])
+            if str(w).strip()
+        ]
+        warning = warnings[0] if warnings else ""
+        if len(warning) > 80:
+            warning = warning[:77] + "..."
+        label = f"{network}({assets})"
+        if state == "ok":
+            ok.append(label)
+        elif state == "partial":
+            partial.append(f"{label}: {warning}" if warning else label)
+        elif state == "skipped":
+            skipped.append(f"{network}: {warning}" if warning else network)
+        else:
+            failed.append(f"{network}: {warning}" if warning else network)
+
+    parts = ["synced wallet tokens via Alchemy + DefiLlama/DexScreener prices"]
+    if ok:
+        parts.append("ok " + ", ".join(ok))
+    if partial:
+        parts.append("partial " + "; ".join(partial))
+    if skipped:
+        parts.append("skipped " + "; ".join(skipped))
+    if failed:
+        parts.append("failed " + "; ".join(failed))
+    return " | ".join(parts)
+
+
 def _sync_onchain(db: Session, account: m.AccountRow) -> SyncResult:
     if _is_mock_address(account.addr):
         return _result(
@@ -572,19 +618,33 @@ def _sync_onchain(db: Session, account: m.AccountRow) -> SyncResult:
                 "solana": fetch_alchemy_solana_wallet_assets,
                 "sui": fetch_alchemy_sui_wallet_assets,
             }[chain]
-            payload = fetcher(account.addr, api_key=alchemy_key)
+            payload = fetcher(
+                account.addr,
+                api_key=alchemy_key,
+                excluded_token_keys=account.excluded_keys or [],
+            )
             new_bal = float(payload.get("balance", 0.0) or 0.0)
             holdings = _build_alchemy_holdings(payload.get("assets") or [])
             provider = f"alchemy-{chain}-token-only"
+            raw_statuses = payload.get("network_statuses")
+            message = _alchemy_status_message(raw_statuses if isinstance(raw_statuses, list) else [])
         else:
             from ..integrations.alchemy import fetch_evm_wallet_assets
 
             networks_raw = os.getenv("ALCHEMY_NETWORKS", "eth,polygon,bnb,arb,opt,base,mantle,scroll")
             networks = [n.strip().lower() for n in networks_raw.split(",") if n.strip()]
-            payload = fetch_evm_wallet_assets(account.addr, alchemy_key, networks, timeout=8.0)
+            payload = fetch_evm_wallet_assets(
+                account.addr,
+                alchemy_key,
+                networks,
+                timeout=8.0,
+                excluded_token_keys=account.excluded_keys or [],
+            )
             new_bal = float(payload.get("balance", 0.0) or 0.0)
             holdings = _build_alchemy_holdings(payload.get("assets") or [])
             provider = "alchemy-token-only"
+            raw_statuses = payload.get("network_statuses")
+            message = _alchemy_status_message(raw_statuses if isinstance(raw_statuses, list) else [])
     except Exception as exc:  # noqa: BLE001
         return _result(account, "error", message=str(exc))
 
@@ -593,7 +653,7 @@ def _sync_onchain(db: Session, account: m.AccountRow) -> SyncResult:
         account,
         "ok",
         balance=account.bal,
-        message="synced wallet tokens via Alchemy + DefiLlama prices",
+        message=message,
     )
 
 

@@ -1,8 +1,8 @@
-"""Lightweight in-process throttles for the paid external APIs.
+"""Lightweight in-process throttles for external APIs.
 
 These are soft guards against accidental spam (a stuck retry loop in the UI,
 or mashing "Sync") — not security controls. They protect the operator's
-Alchemy / CoinMarketCap quota. In-memory state is fine: with
+Alchemy and live price provider quota. In-memory state is fine: with
 multiple uvicorn workers each enforces its own interval, so the effective
 floor is roughly the configured interval divided by the worker count, which
 is good enough for an accidental-spam guard.
@@ -54,10 +54,10 @@ def check_sync_allowed(user_id: str) -> None:
 
 
 def check_price_allowed(user_id: str) -> None:
-    """Per-user guard for paid spot-price lookups.
+    """Per-user guard for spot-price lookups.
 
-    CoinMarketCap requests cost quota even though the endpoint is just a UI
-    convenience. This in-memory limiter is paired with a cache in
+    Price-provider requests are just a UI convenience, but still need a soft
+    spam guard. This in-memory limiter is paired with a cache in
     integrations/prices.py so normal typing stays responsive.
     """
     if PRICE_MAX_LOOKUPS_PER_WINDOW <= 0 and PRICE_MIN_INTERVAL_SECONDS <= 0:

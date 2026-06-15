@@ -1,13 +1,13 @@
 """Live spot-price lookup for user-entered custom assets.
 
-Uses CoinMarketCap's ``/cryptocurrency/quotes/latest`` endpoint. Requires
-``COINMARKETCAP_API_KEY`` to be set in the environment. When a symbol maps to
-multiple coins (e.g. forked tickers), the response is ranked by ``cmc_rank``
-and we pick the top one so you get the canonical BTC/ETH/SOL and not some
-obscure clone.
+Provider order is DefiLlama first, then DexScreener. DefiLlama needs canonical
+coin ids, so symbol lookups use the built-in map below. DexScreener is the
+fallback for newer or long-tail tokens and chooses the deepest exact-symbol
+pair by USD liquidity.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import threading
@@ -17,35 +17,194 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-CMC_QUOTES_URL = "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest"
+DEFILLAMA_PRICES_URL = "https://coins.llama.fi/prices/current/{coins}"
+DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 PRICE_CACHE_TTL_SECONDS = int(os.getenv("PRICE_CACHE_TTL_SECONDS", "300"))
 
 _cache_lock = threading.Lock()
-_price_cache: dict[str, tuple[float, float]] = {}
+_price_cache: dict[str, tuple[float, float, str]] = {}
+
+_DEFILLAMA_SYMBOL_IDS: dict[str, str] = {
+    "1INCH": "1inch",
+    "AAVE": "aave",
+    "ADA": "cardano",
+    "APT": "aptos",
+    "ARB": "arbitrum",
+    "ATOM": "cosmos",
+    "AVAX": "avalanche-2",
+    "BCH": "bitcoin-cash",
+    "BNB": "binancecoin",
+    "BONK": "bonk",
+    "BTC": "bitcoin",
+    "DAI": "dai",
+    "DOGE": "dogecoin",
+    "DOT": "polkadot",
+    "ENA": "ethena",
+    "ETC": "ethereum-classic",
+    "ETH": "ethereum",
+    "FET": "artificial-superintelligence-alliance",
+    "FIL": "filecoin",
+    "HBAR": "hedera-hashgraph",
+    "HYPE": "hyperliquid",
+    "ICP": "internet-computer",
+    "IMX": "immutable-x",
+    "INJ": "injective-protocol",
+    "JUP": "jupiter-exchange-solana",
+    "KAS": "kaspa",
+    "LDO": "lido-dao",
+    "LINK": "chainlink",
+    "LTC": "litecoin",
+    "MATIC": "polygon-ecosystem-token",
+    "NEAR": "near",
+    "OKB": "okb",
+    "OP": "optimism",
+    "PEPE": "pepe",
+    "POL": "polygon-ecosystem-token",
+    "RENDER": "render-token",
+    "SEI": "sei-network",
+    "SHIB": "shiba-inu",
+    "SOL": "solana",
+    "SUI": "sui",
+    "TAO": "bittensor",
+    "TON": "the-open-network",
+    "TRX": "tron",
+    "UNI": "uniswap",
+    "USDC": "usd-coin",
+    "USDT": "tether",
+    "WBTC": "wrapped-bitcoin",
+    "WETH": "weth",
+    "WIF": "dogwifcoin",
+    "XLM": "stellar",
+    "XRP": "ripple",
+}
+
+_STABLE_SYMBOLS = {"BUSD", "FDUSD", "PYUSD", "TUSD", "USDD", "USDE", "USDP", "USD"}
 
 
 class PriceNotFound(Exception):
     """Raised when we can't resolve a USD price for the given symbol."""
 
 
-def _pick_canonical(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """CMC's v2 quotes endpoint returns a list per symbol (one entry per
-    coin that shares the ticker). Pick the one with the lowest ``cmc_rank``
-    (rank 1 = biggest market cap). Entries without a rank sort last."""
-    if not entries:
-        return None
-
-    def sort_key(e: dict[str, Any]) -> tuple[int, int]:
-        rank = e.get("cmc_rank")
-        if isinstance(rank, int) and rank > 0:
-            return (0, rank)
-        return (1, 0)
-
-    return sorted(entries, key=sort_key)[0]
+@dataclass(frozen=True)
+class SpotQuote:
+    price_usd: float
+    source: str
 
 
-def fetch_spot_price_usd(symbol: str, *, timeout: float = 8.0) -> float:
-    """Return the current USD spot price for ``symbol`` (e.g. ``"BTC"``)."""
+def _to_positive_float(value: Any, *, context: str) -> float:
+    try:
+        price = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PriceNotFound(f"bad price payload from {context}") from exc
+    if price <= 0:
+        raise PriceNotFound(f"non-positive price from {context}")
+    return price
+
+
+def _request_json(url: str, *, timeout: float, headers: dict[str, str] | None = None) -> Any:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "accept": "application/json",
+            "user-agent": "crypto-portfolio-tracker/1.0",
+            **(headers or {}),
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _defillama_symbol_ids() -> dict[str, str]:
+    raw = (os.getenv("DEFILLAMA_SYMBOL_PRICE_IDS") or "").strip()
+    if not raw:
+        return _DEFILLAMA_SYMBOL_IDS
+    try:
+        extra = json.loads(raw)
+    except json.JSONDecodeError:
+        return _DEFILLAMA_SYMBOL_IDS
+    if not isinstance(extra, dict):
+        return _DEFILLAMA_SYMBOL_IDS
+    merged = dict(_DEFILLAMA_SYMBOL_IDS)
+    for symbol, coin_id in extra.items():
+        sym = str(symbol or "").strip().upper()
+        cid = str(coin_id or "").strip()
+        if sym and cid:
+            merged[sym] = cid
+    return merged
+
+
+def _fetch_defillama_price_usd(sym: str, *, timeout: float) -> float:
+    coin_id = _defillama_symbol_ids().get(sym)
+    if not coin_id:
+        if sym in _STABLE_SYMBOLS:
+            return 1.0
+        raise PriceNotFound(f"no DefiLlama id for {sym}")
+    coin_key = f"coingecko:{coin_id}"
+    url = DEFILLAMA_PRICES_URL.format(coins=urllib.parse.quote(coin_key, safe=":,"))
+    try:
+        payload = _request_json(url, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        raise PriceNotFound(f"DefiLlama lookup failed ({exc.code})") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PriceNotFound(f"DefiLlama lookup failed: {exc}") from exc
+
+    coins = (payload or {}).get("coins") if isinstance(payload, dict) else None
+    item = coins.get(coin_key) if isinstance(coins, dict) else None
+    if not isinstance(item, dict):
+        raise PriceNotFound(f"no DefiLlama price data for {sym}")
+    return _to_positive_float(item.get("price"), context="DefiLlama")
+
+
+def _symbol_matches(value: Any, sym: str) -> bool:
+    token_symbol = str(value or "").strip().upper()
+    return token_symbol == sym or token_symbol.replace("$", "").replace(" ", "") == sym
+
+
+def _liquidity_usd(pair: dict[str, Any]) -> float:
+    liquidity = pair.get("liquidity")
+    if not isinstance(liquidity, dict):
+        return 0.0
+    try:
+        return float(liquidity.get("usd") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fetch_dexscreener_price_usd(sym: str, *, timeout: float) -> float:
+    query = urllib.parse.urlencode({"q": sym})
+    try:
+        payload = _request_json(f"{DEXSCREENER_SEARCH_URL}?{query}", timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        raise PriceNotFound(f"DexScreener lookup failed ({exc.code})") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PriceNotFound(f"DexScreener lookup failed: {exc}") from exc
+
+    pairs = (payload or {}).get("pairs") if isinstance(payload, dict) else None
+    if not isinstance(pairs, list):
+        raise PriceNotFound(f"no DexScreener price data for {sym}")
+
+    candidates: list[dict[str, Any]] = []
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        base_token = pair.get("baseToken")
+        if not isinstance(base_token, dict) or not _symbol_matches(base_token.get("symbol"), sym):
+            continue
+        try:
+            _to_positive_float(pair.get("priceUsd"), context="DexScreener")
+        except PriceNotFound:
+            continue
+        candidates.append(pair)
+    if not candidates:
+        raise PriceNotFound(f"no DexScreener price data for {sym}")
+
+    best = max(candidates, key=_liquidity_usd)
+    return _to_positive_float(best.get("priceUsd"), context="DexScreener")
+
+
+def fetch_spot_quote_usd(symbol: str, *, timeout: float = 8.0) -> SpotQuote:
+    """Return the current USD spot quote for ``symbol`` (e.g. ``"BTC"``)."""
     sym = (symbol or "").strip().upper()
     if not sym:
         raise PriceNotFound("symbol is required")
@@ -54,56 +213,30 @@ def fetch_spot_price_usd(symbol: str, *, timeout: float = 8.0) -> float:
         with _cache_lock:
             cached = _price_cache.get(sym)
             if cached is not None:
-                cached_at, cached_price = cached
+                cached_at, cached_price, cached_source = cached
                 if now - cached_at < PRICE_CACHE_TTL_SECONDS:
-                    return cached_price
+                    return SpotQuote(price_usd=cached_price, source=cached_source)
 
-    api_key = (os.getenv("COINMARKETCAP_API_KEY") or "").strip()
-    if not api_key:
-        raise PriceNotFound("server missing COINMARKETCAP_API_KEY")
-
-    query = urllib.parse.urlencode({"symbol": sym, "convert": "USD"})
-    request = urllib.request.Request(
-        f"{CMC_QUOTES_URL}?{query}",
-        headers={
-            "accept": "application/json",
-            "X-CMC_PRO_API_KEY": api_key,
-        },
-        method="GET",
+    errors: list[str] = []
+    providers = (
+        ("defillama", _fetch_defillama_price_usd),
+        ("dexscreener", _fetch_dexscreener_price_usd),
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code == 400:
-            raise PriceNotFound(f"unknown symbol {sym}") from exc
-        if exc.code == 401:
-            raise PriceNotFound("CoinMarketCap rejected the API key") from exc
-        if exc.code == 429:
-            raise PriceNotFound("CoinMarketCap rate limit hit") from exc
-        raise PriceNotFound(f"price lookup failed ({exc.code})") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise PriceNotFound(f"price lookup failed: {exc}") from exc
+    for source, fetcher in providers:
+        try:
+            price_f = fetcher(sym, timeout=timeout)
+        except PriceNotFound as exc:
+            errors.append(str(exc))
+            continue
+        if PRICE_CACHE_TTL_SECONDS > 0:
+            with _cache_lock:
+                _price_cache[sym] = (time.monotonic(), price_f, source)
+        return SpotQuote(price_usd=price_f, source=source)
 
-    data = (payload or {}).get("data") if isinstance(payload, dict) else None
-    entries = data.get(sym) if isinstance(data, dict) else None
-    # v2 returns a list; v1 returned a single dict — tolerate both shapes.
-    if isinstance(entries, dict):
-        entries = [entries]
-    if not isinstance(entries, list) or not entries:
-        raise PriceNotFound(f"no price data for {sym}")
+    detail = "; ".join(errors) if errors else f"no price data for {sym}"
+    raise PriceNotFound(detail)
 
-    best = _pick_canonical(entries)
-    quote = (best or {}).get("quote") if isinstance(best, dict) else None
-    usd = (quote or {}).get("USD") if isinstance(quote, dict) else None
-    price = (usd or {}).get("price") if isinstance(usd, dict) else None
-    try:
-        price_f = float(price)
-    except (TypeError, ValueError) as exc:
-        raise PriceNotFound(f"bad price payload for {sym}") from exc
-    if price_f <= 0:
-        raise PriceNotFound(f"non-positive price for {sym}")
-    if PRICE_CACHE_TTL_SECONDS > 0:
-        with _cache_lock:
-            _price_cache[sym] = (time.monotonic(), price_f)
-    return price_f
+
+def fetch_spot_price_usd(symbol: str, *, timeout: float = 8.0) -> float:
+    """Return the current USD spot price for ``symbol`` (e.g. ``"BTC"``)."""
+    return fetch_spot_quote_usd(symbol, timeout=timeout).price_usd

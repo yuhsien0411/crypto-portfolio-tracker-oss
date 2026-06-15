@@ -141,7 +141,7 @@ export function AccountDetailModal({
     h.key ? excludedSet.has(h.key) : !!h.excluded;
   const visibleHoldings = hideDust
     ? holdings.filter(
-        (h) => Math.abs(h.usd) >= HIDE_THRESHOLD_USD || isExcluded(h),
+        (h) => Math.abs(h.usd) >= HIDE_THRESHOLD_USD,
       )
     : holdings;
   const tokens = visibleHoldings.filter((h) => h.kind === "tok");
