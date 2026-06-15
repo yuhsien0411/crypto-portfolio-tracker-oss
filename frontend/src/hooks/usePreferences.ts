@@ -13,7 +13,7 @@ const DEFAULTS: Preferences = {
 };
 
 const STORAGE_KEY = "portfolio:prefs:v1";
-const SUPPORTED_LANGS = ["EN", "ZH"] as const;
+const SUPPORTED_LANGS = ["EN", "ZH", "ZH_TW"] as const;
 
 function read(): Preferences {
   try {

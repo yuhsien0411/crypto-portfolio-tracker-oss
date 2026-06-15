@@ -1,8 +1,4 @@
-"""Alchemy token-only wallet clients with DefiLlama prices.
-
-This is a lightweight fallback for operators who only need wallet token
-balances and USD prices, not DeBank-style DeFi positions.
-"""
+"""Alchemy token-only wallet clients with DefiLlama prices."""
 from __future__ import annotations
 
 import json

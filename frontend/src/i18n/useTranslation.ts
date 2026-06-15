@@ -1,8 +1,9 @@
 import { usePreferences } from "../hooks/usePreferences";
 import { en, type TranslationDict } from "./en";
 import { zh } from "./zh";
+import { zhTw } from "./zhTw";
 
-const DICTS: Record<string, TranslationDict> = { EN: en, ZH: zh };
+const DICTS: Record<string, TranslationDict> = { EN: en, ZH: zh, ZH_TW: zhTw };
 
 /**
  * Tiny i18n hook. Returns the typed translation dict for the current language

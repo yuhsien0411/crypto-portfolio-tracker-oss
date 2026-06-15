@@ -6,7 +6,8 @@ import { useTranslation } from "../i18n/useTranslation";
 
 const LANGS = [
   { code: "EN", label: "English" },
-  { code: "ZH", label: "中文" },
+  { code: "ZH", label: "简体中文" },
+  { code: "ZH_TW", label: "繁體中文" },
 ];
 
 type Panel = "main" | "lang";

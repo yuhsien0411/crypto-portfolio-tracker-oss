@@ -117,7 +117,7 @@ export const api = {
     http<BalanceHistory>(`/api/balance/history?range=${range}`),
   cashflow: () => http<CashflowSummary>("/api/cashflow"),
 
-  // Credentials — CEX only (debank/coinstats are server-side env)
+  // Credentials — CEX only (on-chain provider keys are server-side env)
   credentialsStatus: () => http<CredentialsStatus>("/api/credentials"),
   setCexCredential: (accountId: string, body: CexCredentialInput) =>
     http<CexCredentialStatus>(`/api/credentials/cex/${accountId}`, {

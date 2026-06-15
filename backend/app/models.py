@@ -95,10 +95,8 @@ class Holding(BaseModel):
     d: float
     c: str
     apr: Optional[str] = None
-    # Icon URLs sourced from DeBank. `logo` is the token or protocol logo shown
-    # at the asset level; `proto_logo` is the app logo for positions (kept
-    # separately so a grouped protocol row can always render the app icon even
-    # when its first member has no per-item logo).
+    # Icon URLs supplied by upstream providers. `logo` is the token or protocol
+    # logo shown at the asset level; `proto_logo` is the app logo for positions.
     logo: Optional[str] = None
     proto_logo: Optional[str] = None
     # Unformatted numbers — set only for `custom` source holdings so the

@@ -18,7 +18,7 @@ import { NewGroupModal } from "./NewGroupModal";
 
 // ── Account type taxonomy ───────────────────────────────────────────────
 
-type OnchainKind = "evm" | "solana" | "sui" | "cosmos";
+type OnchainKind = "evm" | "solana" | "sui";
 
 type CredField = "api_key" | "api_secret" | "passphrase" | "wallet_address";
 
@@ -79,14 +79,12 @@ function deriveOnchainKind(chain: string | null | undefined): OnchainKind {
   const c = (chain ?? "").toLowerCase();
   if (c === "solana") return "solana";
   if (c === "sui") return "sui";
-  if (c === "cosmos") return "cosmos";
   return "evm";
 }
 
 function chainLabelForKind(kind: OnchainKind): string {
   if (kind === "solana") return "Solana";
   if (kind === "sui") return "Sui";
-  if (kind === "cosmos") return "Cosmos";
   return "EVM";
 }
 
@@ -132,6 +130,7 @@ export function EditAccountPanel({
   const [onchainKind, setOnchainKind] = useState<OnchainKind>(
     deriveOnchainKind(account?.chain),
   );
+  const [onchainKindTouched, setOnchainKindTouched] = useState(false);
   const [walletAddress, setWalletAddress] = useState(
     account?.source === "onchain" ? (account?.addr ?? "") : "",
   );
@@ -331,11 +330,14 @@ export function EditAccountPanel({
   function buildAccountPayload(): AccountInput {
     const base = { name: name.trim(), group, note };
     if (accountType === "onchain") {
+      const originalChain = (account?.chain ?? "").trim();
+      const preserveUnsupportedChain =
+        !isNew && !onchainKindTouched && originalChain.toLowerCase() === "cosmos";
       return {
         ...base,
         source: "onchain",
         addr: walletAddress.trim(),
-        chain: chainLabelForKind(onchainKind),
+        chain: preserveUnsupportedChain ? originalChain : chainLabelForKind(onchainKind),
       };
     }
     if (accountType === "exchange") {
@@ -374,8 +376,7 @@ export function EditAccountPanel({
   }
 
   const providerLabel = (() => {
-    if (accountType === "onchain")
-      return onchainKind === "evm" ? t.editAcct.providerDeBank : t.editAcct.providerCoinStats;
+    if (accountType === "onchain") return t.editAcct.providerAlchemy;
     if (accountType === "exchange") return currentExchange.label;
     return t.editAcct.providerManual;
   })();
@@ -471,7 +472,10 @@ export function EditAccountPanel({
         {accountType === "onchain" && (
           <OnchainFields
             kind={onchainKind}
-            setKind={setOnchainKind}
+            setKind={(kind) => {
+              setOnchainKindTouched(true);
+              setOnchainKind(kind);
+            }}
             addr={walletAddress}
             setAddr={setWalletAddress}
             name={name}
@@ -663,7 +667,7 @@ function OnchainFields({
               color: kind === "evm" ? "rgba(245,241,232,0.7)" : "var(--muted)",
             }}
           >
-            DeBank
+            Alchemy
           </span>
         </span>
         <span
@@ -679,7 +683,7 @@ function OnchainFields({
               color: kind === "solana" ? "rgba(245,241,232,0.7)" : "var(--muted)",
             }}
           >
-            CoinStats
+            Alchemy
           </span>
         </span>
         <span
@@ -695,23 +699,7 @@ function OnchainFields({
               color: kind === "sui" ? "rgba(245,241,232,0.7)" : "var(--muted)",
             }}
           >
-            CoinStats
-          </span>
-        </span>
-        <span
-          onClick={() => setKind("cosmos")}
-          className={"pill" + (kind === "cosmos" ? " active" : "")}
-          title={t.editAcct.cosmosTip}
-        >
-          Cosmos
-          <span
-            className="tiny"
-            style={{
-              marginLeft: 6,
-              color: kind === "cosmos" ? "rgba(245,241,232,0.7)" : "var(--muted)",
-            }}
-          >
-            CoinStats
+            Alchemy
           </span>
         </span>
       </div>
@@ -735,8 +723,6 @@ function OnchainFields({
             ? t.editAcct.walletAddressPlaceholderSolana
             : kind === "sui"
             ? t.editAcct.walletAddressPlaceholderSui
-            : kind === "cosmos"
-            ? t.editAcct.walletAddressPlaceholderCosmos
             : t.editAcct.walletAddressPlaceholderEvm
         }
         style={{ marginBottom: 14 }}

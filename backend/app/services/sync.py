@@ -1,8 +1,8 @@
 """Sync service — per-user, DB-backed.
 
-DeBank and CoinStats keys come from environment variables (configured by the
-operator via `.env`). Per-account CEX credentials come from the user's
-`cex_credentials` rows. Balances + snapshots are persisted into the DB.
+Alchemy comes from the operator's environment. Per-account CEX credentials
+come from the user's `cex_credentials` rows. Balances + snapshots are
+persisted into the DB.
 """
 from __future__ import annotations
 
@@ -55,17 +55,6 @@ def _excluded_usd(holdings: list[dict[str, Any]], excluded_keys: list[str]) -> f
     )
 
 
-def _is_hyperliquid_chain(chain: Any) -> bool:
-    # DeBank coverage of Hyperliquid (chain id "hyper") is unreliable. We sync
-    # Hyperliquid via its own info API as an exchange account, so strip any
-    # Hyperliquid entries out of the DeBank wallet/app payloads to avoid
-    # double-counting and stale balances.
-    if not chain:
-        return False
-    c = str(chain).lower()
-    return c.startswith("hyper") or c == "hl"
-
-
 def _color_for(key: str) -> str:
     if not key:
         return _HOLDING_PALETTE[0]
@@ -89,263 +78,6 @@ def _fmt_price(x: float) -> str:
     if x > 0:
         return f"${x:.4f}".rstrip("0").rstrip(".")
     return "—"
-
-
-def _fmt_amount_opt(v: Any) -> str:
-    try:
-        return _fmt_amount(float(v)) if v not in (None, "") else "—"
-    except (TypeError, ValueError):
-        return "—"
-
-
-def _fmt_price_opt(v: Any) -> str:
-    try:
-        return _fmt_price(float(v)) if v not in (None, "") else "—"
-    except (TypeError, ValueError):
-        return "—"
-
-
-def _token_syms(tokens: list[dict[str, Any]]) -> str:
-    out: list[str] = []
-    for t in tokens or []:
-        s = str(t.get("optimized_symbol") or t.get("symbol") or "").strip()
-        if s and s not in out:
-            out.append(s)
-    return " / ".join(out)
-
-
-def _describe_item(
-    category: str, detail: dict[str, Any], detail_type: str
-) -> dict[str, Any]:
-    """Turn a DeBank portfolio_item's `detail` block into the descriptive
-    fields our UI needs (label, sym, amt, price, logo).
-
-    DeBank groups positions by `detail_types` (e.g. ``perpetuals``,
-    ``prediction``, ``lending``, ``common``). Each type stores its
-    distinguishing information under different keys on `detail`, so we
-    dispatch on the primary detail type and fall back to the generic
-    supply/borrow token shape used by deposits, staking, LPs, etc."""
-
-    # Prediction markets — the market question is in detail.name.
-    if detail_type == "prediction":
-        name = str(detail.get("name") or "").strip() or category or "Prediction"
-        side = str(detail.get("side") or "").strip()
-        label = f"{name} · {side}" if side else name
-        sym = (side.upper() or "PRED")[:8]
-        return {
-            "label": label,
-            "sym": sym,
-            "amt": _fmt_amount_opt(detail.get("amount")),
-            "price": _fmt_price_opt(detail.get("price")),
-            "logo": None,
-        }
-
-    # Perpetual futures — build "<side> <asset> · <lev>x" and surface the
-    # underlying asset amount/price + icon.
-    if detail_type in ("perpetuals", "perpetual", "perp"):
-        position_token = detail.get("position_token") or detail.get("base_token") or {}
-        sym = str(
-            position_token.get("optimized_symbol")
-            or position_token.get("symbol")
-            or ""
-        ).upper() or "PERP"
-        side = str(detail.get("side") or "").strip()
-        bits = [b for b in (side, sym) if b]
-        label = " ".join(bits) if bits else (category or "Perpetual")
-        try:
-            lev = float(detail.get("leverage") or 0.0)
-        except (TypeError, ValueError):
-            lev = 0.0
-        if lev > 0:
-            label = f"{label} · {lev:g}x"
-        return {
-            "label": label,
-            "sym": sym,
-            "amt": _fmt_amount_opt(position_token.get("amount")),
-            "price": _fmt_price_opt(position_token.get("price")),
-            "logo": str(position_token.get("logo_url") or "") or None,
-        }
-
-    # Options — if DeBank starts returning them, prefer the named contract.
-    if detail_type in ("options", "option"):
-        name = str(detail.get("name") or detail.get("description") or "").strip()
-        side = str(detail.get("side") or detail.get("type") or "").strip()
-        strike = detail.get("strike") or detail.get("strike_price")
-        parts = [p for p in (name, side) if p]
-        if strike not in (None, ""):
-            parts.append(f"strike {_fmt_price_opt(strike)}")
-        label = " · ".join(parts) if parts else (category or "Option")
-        underlying = detail.get("underlying_token") or detail.get("position_token") or {}
-        sym = str(
-            underlying.get("optimized_symbol") or underlying.get("symbol") or ""
-        ).upper() or "OPT"
-        return {
-            "label": label,
-            "sym": sym,
-            "amt": _fmt_amount_opt(detail.get("amount") or underlying.get("amount")),
-            "price": _fmt_price_opt(detail.get("price") or underlying.get("price")),
-            "logo": str(underlying.get("logo_url") or "") or None,
-        }
-
-    # Generic fallback: deposits, staking, LPs, lending, locked, rewards — all
-    # carry their underlyings in *_token_list and often a short description.
-    description = str(detail.get("description") or "").strip()
-    supply = detail.get("supply_token_list") or []
-    borrow = detail.get("borrow_token_list") or []
-    reward = detail.get("reward_token_list") or []
-    locked = detail.get("locked_token_list") or []
-    primary = (supply or borrow or reward or locked or [{}])[0] or {}
-
-    if category and description:
-        label = f"{category} · {description}"
-    elif description:
-        label = description
-    else:
-        supply_str = _token_syms(supply)
-        borrow_str = _token_syms(borrow)
-        if supply_str and borrow_str:
-            token_desc = f"supply {supply_str} · borrow {borrow_str}"
-        elif supply_str:
-            token_desc = supply_str
-        elif borrow_str:
-            token_desc = f"borrow {borrow_str}"
-        else:
-            token_desc = _token_syms(reward) or _token_syms(locked)
-        if category and token_desc:
-            label = f"{category}: {token_desc}"
-        else:
-            label = token_desc or category or "Position"
-
-    sym = str(
-        primary.get("optimized_symbol") or primary.get("symbol") or ""
-    ).upper() or category.upper() or "POS"
-
-    if len(supply) == 1:
-        amt = _fmt_amount(float(supply[0].get("amount", 0.0) or 0.0))
-    elif supply:
-        amt = f"{len(supply)} assets"
-    elif len(locked) == 1:
-        amt = _fmt_amount(float(locked[0].get("amount", 0.0) or 0.0))
-    elif len(reward) == 1:
-        amt = _fmt_amount(float(reward[0].get("amount", 0.0) or 0.0))
-    else:
-        amt = "—"
-
-    return {
-        "label": label,
-        "sym": sym,
-        "amt": amt,
-        "price": "—",
-        "logo": str(primary.get("logo_url") or "") or None,
-    }
-
-
-def _token_holding(raw: dict[str, Any]) -> dict[str, Any] | None:
-    # DeBank returns lots of scam airdrops in the wallet token list; skip any
-    # token that DeBank hasn't marked as verified.
-    if not raw.get("is_verified"):
-        return None
-    amount = float(raw.get("amount", 0.0) or 0.0)
-    price = float(raw.get("price", 0.0) or 0.0)
-    usd = amount * price
-    if usd < _MIN_HOLDING_USD:
-        return None
-    sym = str(raw.get("optimized_symbol") or raw.get("symbol") or "").upper() or "?"
-    name = str(raw.get("name") or sym)
-    chain = str(raw.get("chain") or "").lower() or "evm"
-    return {
-        "kind": "tok",
-        "sym": sym,
-        "name": name,
-        "proto": "—",
-        "chain": chain,
-        "amt": _fmt_amount(amount),
-        "price": _fmt_price(price),
-        "usd": round(usd, 2),
-        "d": 0.0,
-        "c": _color_for(sym),
-        "logo": str(raw.get("logo_url") or "") or None,
-    }
-
-
-def _portfolio_position(app: dict[str, Any], item: dict[str, Any]) -> dict[str, Any] | None:
-    stats = item.get("stats") or {}
-    usd = float(stats.get("net_usd_value") or stats.get("asset_usd_value") or 0.0)
-    if usd < _MIN_HOLDING_USD:
-        return None
-    detail = item.get("detail") or {}
-    proto = str(app.get("name") or "—")
-    chain = str(app.get("chain") or detail.get("chain") or "").lower() or "evm"
-    category = str(item.get("name") or "").strip()
-    detail_types = [str(t).lower() for t in (item.get("detail_types") or [])]
-    primary_type = detail_types[0] if detail_types else ""
-
-    descr = _describe_item(category, detail, primary_type)
-
-    apr_raw = item.get("apr") or stats.get("apr")
-    apr = f"{float(apr_raw):.2f}%" if apr_raw not in (None, "") else None
-    proto_logo = str(app.get("logo_url") or "") or None
-    return {
-        "kind": "pos",
-        "sym": descr["sym"],
-        "name": descr["label"],
-        "proto": proto,
-        "chain": chain,
-        "amt": descr["amt"],
-        "price": descr["price"],
-        "usd": round(usd, 2),
-        "d": 0.0,
-        "c": _color_for(proto),
-        "apr": apr,
-        # Per-item logo (position token / underlying) falls back to the app's
-        # logo so the row always has something to render.
-        "logo": descr.get("logo") or proto_logo,
-        "proto_logo": proto_logo,
-    }
-
-
-def _build_evm_holdings(tokens: list[dict[str, Any]], apps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for t in tokens or []:
-        h = _token_holding(t)
-        if h is not None:
-            out.append(h)
-    for app in apps or []:
-        for item in app.get("portfolio_item_list") or []:
-            h = _portfolio_position(app, item)
-            if h is not None:
-                out.append(h)
-    # Sort by USD desc so the UI shows biggest first.
-    out.sort(key=lambda h: h.get("usd", 0.0), reverse=True)
-    return out
-
-
-def _build_coinstats_holdings(
-    assets: list[dict[str, Any]], chain: str
-) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for a in assets or []:
-        amount = float(a.get("amount", 0.0) or 0.0)
-        price = float(a.get("unit_price", 0.0) or 0.0)
-        usd = float(a.get("usd_value") or amount * price)
-        if usd < _MIN_HOLDING_USD:
-            continue
-        sym = str(a.get("symbol") or "").upper() or "?"
-        out.append({
-            "kind": "tok",
-            "sym": sym,
-            "name": str(a.get("name") or sym),
-            "proto": "—",
-            "chain": chain,
-            "amt": _fmt_amount(amount),
-            "price": _fmt_price(price),
-            "usd": round(usd, 2),
-            "d": 0.0,
-            "c": _color_for(sym),
-            "logo": str(a.get("logo_url") or "") or None,
-        })
-    out.sort(key=lambda h: h.get("usd", 0.0), reverse=True)
-    return out
 
 
 def _build_alchemy_holdings(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -824,8 +556,13 @@ def _sync_onchain(db: Session, account: m.AccountRow) -> SyncResult:
             message="address is truncated/mock — edit it in Manage Accounts to enable sync",
         )
     chain = (account.chain or "").lower()
+    if chain == "cosmos":
+        return _result(account, "skipped", message="Cosmos is no longer supported")
+    alchemy_key = (os.getenv("ALCHEMY_API_KEY") or "").strip()
+    if not alchemy_key:
+        return _result(account, "error", message="Server missing ALCHEMY_API_KEY")
     try:
-        if chain in ("solana", "sui") and (os.getenv("ALCHEMY_API_KEY") or "").strip():
+        if chain in ("solana", "sui"):
             from ..integrations.alchemy import (
                 fetch_solana_wallet_assets as fetch_alchemy_solana_wallet_assets,
                 fetch_sui_wallet_assets as fetch_alchemy_sui_wallet_assets,
@@ -835,92 +572,29 @@ def _sync_onchain(db: Session, account: m.AccountRow) -> SyncResult:
                 "solana": fetch_alchemy_solana_wallet_assets,
                 "sui": fetch_alchemy_sui_wallet_assets,
             }[chain]
-            payload = fetcher(account.addr, api_key=(os.getenv("ALCHEMY_API_KEY") or "").strip())
+            payload = fetcher(account.addr, api_key=alchemy_key)
             new_bal = float(payload.get("balance", 0.0) or 0.0)
-            holdings = _build_coinstats_holdings(payload.get("assets") or [], chain)
+            holdings = _build_alchemy_holdings(payload.get("assets") or [])
             provider = f"alchemy-{chain}-token-only"
-        elif chain in ("solana", "sui", "cosmos"):
-            from ..integrations.coinstats import (
-                fetch_cosmos_wallet_assets,
-                fetch_solana_wallet_assets,
-                fetch_sui_wallet_assets,
-            )
-
-            api_key = (os.getenv("COINSTATS_API_KEY") or "").strip()
-            if not api_key:
-                return _result(account, "error", message="Server missing COINSTATS_API_KEY")
-            fetcher = {
-                "sui": fetch_sui_wallet_assets,
-                "cosmos": fetch_cosmos_wallet_assets,
-                "solana": fetch_solana_wallet_assets,
-            }[chain]
-            payload = fetcher(account.addr, api_key=api_key)
-            new_bal = float(payload.get("balance", 0.0) or 0.0)
-            holdings = _build_coinstats_holdings(payload.get("assets") or [], chain)
-            provider = "coinstats"
         else:
-            alchemy_key = (os.getenv("ALCHEMY_API_KEY") or "").strip()
-            if alchemy_key:
-                from ..integrations.alchemy import fetch_evm_wallet_assets
+            from ..integrations.alchemy import fetch_evm_wallet_assets
 
-                networks_raw = os.getenv("ALCHEMY_NETWORKS", "eth,polygon,bnb,arb,opt,base,mantle,scroll")
-                networks = [n.strip().lower() for n in networks_raw.split(",") if n.strip()]
-                payload = fetch_evm_wallet_assets(account.addr, alchemy_key, networks, timeout=8.0)
-                new_bal = float(payload.get("balance", 0.0) or 0.0)
-                holdings = _build_alchemy_holdings(payload.get("assets") or [])
-                provider = "alchemy-token-only"
-                _persist_snapshot(db, account, new_bal, provider, holdings=holdings)
-                return _result(
-                    account,
-                    "ok",
-                    balance=account.bal,
-                    message="synced wallet tokens via Alchemy + DefiLlama prices",
-                )
-            from ..integrations.debank import (
-                fetch_all_token_list,
-                fetch_complex_app_list,
-                fetch_total_balance,
-            )
-
-            access_key = (os.getenv("DEBANK_ACCESS_KEY") or "").strip()
-            if not access_key:
-                return _result(account, "error", message="Server missing DEBANK_ACCESS_KEY")
-            payload = fetch_total_balance(account.addr, access_key)
-            # /total_balance covers wallet tokens across all chains BUT does NOT
-            # include DeFi app positions (lending, LPs, staking, etc.). Those
-            # come from /complex_app_list and have to be added on top.
-            tokens_only_bal = float(payload.get("total_usd_value", 0.0) or 0.0)
-            # Hyperliquid coverage on DeBank is unreliable; drop its contribution
-            # so the dedicated Hyperliquid info API is the sole source of truth.
-            for entry in payload.get("chain_list") or []:
-                if _is_hyperliquid_chain(entry.get("id") or entry.get("name")):
-                    tokens_only_bal -= float(entry.get("usd_value", 0.0) or 0.0)
-            tokens_only_bal = max(tokens_only_bal, 0.0)
-            tokens_raw: list[dict[str, Any]] = []
-            apps_raw: list[dict[str, Any]] = []
-            try:
-                tokens_raw = fetch_all_token_list(account.addr, access_key)
-            except Exception:  # noqa: BLE001 — partial-failure tolerant
-                tokens_raw = []
-            try:
-                apps_raw = fetch_complex_app_list(account.addr, access_key)
-            except Exception:  # noqa: BLE001
-                apps_raw = []
-            tokens_raw = [t for t in tokens_raw if not _is_hyperliquid_chain(t.get("chain"))]
-            apps_raw = [a for a in apps_raw if not _is_hyperliquid_chain(a.get("chain"))]
-            holdings = _build_evm_holdings(tokens_raw, apps_raw)
-            positions_bal = sum(
-                float(h.get("usd", 0.0) or 0.0)
-                for h in holdings
-                if h.get("kind") == "pos"
-            )
-            new_bal = tokens_only_bal + positions_bal
-            provider = "debank"
+            networks_raw = os.getenv("ALCHEMY_NETWORKS", "eth,polygon,bnb,arb,opt,base,mantle,scroll")
+            networks = [n.strip().lower() for n in networks_raw.split(",") if n.strip()]
+            payload = fetch_evm_wallet_assets(account.addr, alchemy_key, networks, timeout=8.0)
+            new_bal = float(payload.get("balance", 0.0) or 0.0)
+            holdings = _build_alchemy_holdings(payload.get("assets") or [])
+            provider = "alchemy-token-only"
     except Exception as exc:  # noqa: BLE001
         return _result(account, "error", message=str(exc))
 
     _persist_snapshot(db, account, new_bal, provider, holdings=holdings)
-    return _result(account, "ok", balance=account.bal, message=f"synced via {provider}")
+    return _result(
+        account,
+        "ok",
+        balance=account.bal,
+        message="synced wallet tokens via Alchemy + DefiLlama prices",
+    )
 
 
 def _sync_exchange(db: Session, account: m.AccountRow, exchange: str | None) -> SyncResult:
@@ -986,21 +660,17 @@ def _sync_dispatch(db: Session, account: m.AccountRow) -> SyncResult:
 
 
 def _hits_paid_api(account: m.AccountRow) -> bool:
-    """Does syncing this account call a paid external API (DeBank / CoinStats)?
+    """Does syncing this account call the operator's on-chain API provider?
 
     Only onchain sources do. Exchange syncs call CEX APIs directly with the
     user's own keys; custom rows and mock/truncated addresses short-circuit
-    inside ``_sync_dispatch`` and never make a request. Alchemy token-only
-    mode is not counted as a paid DeBank/CoinStats API for the confirmation
-    dialog."""
+    inside ``_sync_dispatch`` and never make a request."""
     if account.source != "onchain":
         return False
     if _is_mock_address(account.addr):
         return False
     chain = (account.chain or "").lower()
-    if chain in ("solana", "sui") and (os.getenv("ALCHEMY_API_KEY") or "").strip():
-        return False
-    if chain not in ("solana", "sui", "cosmos") and (os.getenv("ALCHEMY_API_KEY") or "").strip():
+    if chain == "cosmos":
         return False
     return True
 
@@ -1075,7 +745,12 @@ def validate_account(
 def _validate_onchain(account: m.AccountRow) -> None:
     chain = (account.chain or "").lower()
     try:
-        if chain in ("solana", "sui") and (os.getenv("ALCHEMY_API_KEY") or "").strip():
+        if chain == "cosmos":
+            raise ValidationFailed("Cosmos is no longer supported")
+        alchemy_key = (os.getenv("ALCHEMY_API_KEY") or "").strip()
+        if not alchemy_key:
+            raise ValidationFailed("Server missing ALCHEMY_API_KEY")
+        if chain in ("solana", "sui"):
             from ..integrations.alchemy import (
                 fetch_solana_wallet_assets as fetch_alchemy_solana_wallet_assets,
                 fetch_sui_wallet_assets as fetch_alchemy_sui_wallet_assets,
@@ -1085,40 +760,13 @@ def _validate_onchain(account: m.AccountRow) -> None:
                 "solana": fetch_alchemy_solana_wallet_assets,
                 "sui": fetch_alchemy_sui_wallet_assets,
             }[chain]
-            fetcher(account.addr, api_key=(os.getenv("ALCHEMY_API_KEY") or "").strip())
+            fetcher(account.addr, api_key=alchemy_key)
             return
-        if chain in ("solana", "sui", "cosmos"):
-            from ..integrations.coinstats import (
-                fetch_cosmos_wallet_assets,
-                fetch_solana_wallet_assets,
-                fetch_sui_wallet_assets,
-            )
+        from ..integrations.alchemy import fetch_evm_wallet_assets
 
-            api_key = (os.getenv("COINSTATS_API_KEY") or "").strip()
-            if not api_key:
-                raise ValidationFailed("Server missing COINSTATS_API_KEY")
-            fetcher = {
-                "sui": fetch_sui_wallet_assets,
-                "cosmos": fetch_cosmos_wallet_assets,
-                "solana": fetch_solana_wallet_assets,
-            }[chain]
-            fetcher(account.addr, api_key=api_key)
-        else:
-            alchemy_key = (os.getenv("ALCHEMY_API_KEY") or "").strip()
-            if alchemy_key:
-                from ..integrations.alchemy import fetch_evm_wallet_assets
-
-                networks_raw = os.getenv("ALCHEMY_NETWORKS", "eth,polygon,bnb,arb,opt,base,mantle,scroll")
-                networks = [n.strip().lower() for n in networks_raw.split(",") if n.strip()]
-                fetch_evm_wallet_assets(account.addr, alchemy_key, networks, timeout=8.0)
-                return
-
-            from ..integrations.debank import fetch_total_balance
-
-            access_key = (os.getenv("DEBANK_ACCESS_KEY") or "").strip()
-            if not access_key:
-                raise ValidationFailed("Server missing ALCHEMY_API_KEY or DEBANK_ACCESS_KEY")
-            fetch_total_balance(account.addr, access_key)
+        networks_raw = os.getenv("ALCHEMY_NETWORKS", "eth,polygon,bnb,arb,opt,base,mantle,scroll")
+        networks = [n.strip().lower() for n in networks_raw.split(",") if n.strip()]
+        fetch_evm_wallet_assets(account.addr, alchemy_key, networks, timeout=8.0)
     except ValidationFailed:
         raise
     except Exception as exc:  # noqa: BLE001

@@ -1,8 +1,4 @@
-"""Credentials endpoints — CEX-only, per-user.
-
-DeBank and CoinStats keys are set by the deployment (via `.env`) and are not
-exposed to end-users.
-"""
+"""Credentials endpoints — CEX-only, per-user."""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException

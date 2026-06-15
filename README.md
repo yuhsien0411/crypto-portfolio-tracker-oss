@@ -10,9 +10,9 @@ hosted billing, no email provider required.
 
 ## Features
 
-- **On-chain wallets** — EVM via [DeBank](https://cloud.debank.com/) (wallet
-  tokens **plus** DeFi positions: lending, LPs, staking, perps); Solana / Sui /
-  Cosmos via [CoinStats](https://openapi.coinstats.app/).
+- **On-chain wallets** — EVM, Solana, and Sui via
+  [Alchemy](https://www.alchemy.com/), with token balances priced via
+  DefiLlama. Cosmos is no longer supported.
 - **Exchanges & perp DEXs** — Binance · Bitget · OKX · Bybit · Gate ·
   Hyperliquid · Derive · Extended. Keys are entered in the UI and stored
   **encrypted at rest**.
@@ -26,7 +26,8 @@ hosted billing, no email provider required.
 ## Stack
 
 - **Backend** — Python 3.12, FastAPI, SQLAlchemy, SQLite (Postgres optional).
-- **Frontend** — React 18 + TypeScript + Vite + React Router. English + 中文.
+- **Frontend** — React 18 + TypeScript + Vite + React Router. English,
+  简体中文, and 繁體中文.
 - **Deploy** — Docker Compose (backend Uvicorn on `:8000`, frontend Nginx on
   `:80` serving the SPA and proxying `/api/*`).
 
@@ -47,17 +48,11 @@ python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 Add provider keys for the data sources you use:
 
-- `ALCHEMY_API_KEY` for free/low-cost EVM wallet token balances and Solana
-  wallet token balances, priced via DefiLlama. This is token-only and does not
-  include DeFi positions.
-- `DEBANK_ACCESS_KEY` for EVM wallet tokens plus DeFi positions.
-- `COINSTATS_API_KEY` for Solana / Sui / Cosmos wallets.
+- `ALCHEMY_API_KEY` for EVM, Solana, and Sui wallet token balances, priced via
+  DefiLlama. This is token-only and does not include DeFi positions.
 - `COINMARKETCAP_API_KEY` for custom assets that use live prices.
 
-When both `ALCHEMY_API_KEY` and `DEBANK_ACCESS_KEY` are set, EVM on-chain
-accounts use Alchemy token-only mode first. Solana accounts also use Alchemy
-when `ALCHEMY_API_KEY` is set, falling back to CoinStats otherwise. Set
-`ALCHEMY_NETWORKS` to choose which EVM chains to scan; default is
+Set `ALCHEMY_NETWORKS` to choose which EVM chains to scan; default is
 `eth,polygon,bnb,arb,opt,base,mantle,scroll`.
 For very noisy wallets, tune `ALCHEMY_MAX_TOKENS_PER_NETWORK` (default `25`)
 and `ALCHEMY_METADATA_TIMEOUT_SECONDS` (default `3`) to keep syncs responsive.
@@ -98,8 +93,9 @@ Health check: `GET /api/health`. Set `ENABLE_API_DOCS=1` for `/docs`.
 
 ## How credentials work
 
-- **Global provider keys** (`.env`): `DEBANK_ACCESS_KEY`, `COINSTATS_API_KEY`,
-  `COINMARKETCAP_API_KEY`. Used by the server to read public on-chain data.
+- **Global provider keys** (`.env`): `ALCHEMY_API_KEY` and
+  `COINMARKETCAP_API_KEY`. Used by the server to read public on-chain data and
+  refresh live-priced custom assets.
 - **Per-account exchange keys** (entered in the UI): API key/secret/passphrase
   and wallet address/private key, stored encrypted in the DB with `SECRETS_KEY`.
   The API only ever returns `has_*` booleans, never the secret values.

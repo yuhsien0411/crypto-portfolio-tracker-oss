@@ -659,7 +659,7 @@ function RowSyncButton({
   const [err, setErr] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
 
-  // Only onchain syncs hit a paid upstream (DeBank / CoinStats) — exchange
+  // Only onchain syncs hit the operator's Alchemy quota — exchange
   // and custom accounts are free, so we don't bother prompting for them.
   const needsConfirm = source === "onchain";
 
