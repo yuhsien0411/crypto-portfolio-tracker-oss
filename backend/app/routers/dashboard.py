@@ -11,7 +11,7 @@ from .. import db_models as m
 from ..auth import current_user
 from ..db import get_db
 from ..models import DashboardSummary, TopAsset
-from ..services.sync import holding_key
+from ..services.sync import effective_excluded_keys, holding_key
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
@@ -77,7 +77,7 @@ def top_assets(
     # Map account_id → set of excluded holding keys, so the per-snapshot
     # loop below can skip user-excluded rows without an extra query.
     excluded_by_account: dict[str, set[str]] = {
-        a.id: set(a.excluded_keys or []) for a in accounts
+        a.id: set(effective_excluded_keys(db, a)) for a in accounts
     }
 
     # Group wallet tokens by symbol (USDC, ETH, SOL…) and DeFi positions by

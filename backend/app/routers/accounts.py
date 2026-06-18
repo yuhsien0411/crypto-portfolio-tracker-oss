@@ -83,7 +83,9 @@ def get_account(
     user: m.UserRow = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> AccountDetail:
-    return account_to_detail(_get_owned(db, user.id, account_id))
+    row = _get_owned(db, user.id, account_id)
+    excluded_keys = sync_service.effective_excluded_keys(db, row)
+    return account_to_detail(row, excluded_keys=excluded_keys)
 
 
 @router.post("", response_model=Account, status_code=201)
@@ -151,10 +153,15 @@ def update_account(
     if custom_assets is not None:
         sync_service.apply_custom_assets(db, row, custom_assets)
     if excluded_keys is not None:
-        # De-dup + clamp to strings; the column is JSON so we keep this
-        # defensively typed even though Pydantic already validated it.
-        row.excluded_keys = sorted({str(k) for k in excluded_keys if k})
-        sync_service.recompute_balance_from_snapshot(db, row)
+        if row.source == "onchain":
+            sync_service.apply_shared_onchain_excluded_keys(
+                db,
+                user.id,
+                excluded_keys,
+            )
+        else:
+            row.excluded_keys = sync_service.normalize_excluded_keys(excluded_keys)
+            sync_service.recompute_balance_from_snapshot(db, row)
     db.commit()
     db.refresh(row)
     return account_to_model(row)

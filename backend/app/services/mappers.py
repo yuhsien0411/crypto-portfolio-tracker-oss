@@ -21,11 +21,17 @@ def account_to_model(row: m.AccountRow) -> Account:
     )
 
 
-def account_to_detail(row: m.AccountRow) -> AccountDetail:
+def account_to_detail(
+    row: m.AccountRow,
+    excluded_keys: list[str] | None = None,
+) -> AccountDetail:
     holdings: list[Holding] = []
     synced_at = None
     provider = None
-    excluded_set = set(row.excluded_keys or [])
+    effective_excluded_keys = (
+        excluded_keys if excluded_keys is not None else row.excluded_keys or []
+    )
+    excluded_set = set(effective_excluded_keys)
     if row.snapshot is not None:
         raw_holdings = row.snapshot.holdings or []
         for h in raw_holdings:
@@ -41,5 +47,5 @@ def account_to_detail(row: m.AccountRow) -> AccountDetail:
         holdings=holdings,
         synced_at=synced_at,
         provider=provider,
-        excluded_keys=list(row.excluded_keys or []),
+        excluded_keys=list(effective_excluded_keys),
     )

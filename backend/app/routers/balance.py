@@ -10,7 +10,7 @@ from .. import db_models as m
 from ..auth import current_user
 from ..db import get_db
 from ..models import BalanceHistory, BalancePoint
-from ..services.sync import holding_key
+from ..services.sync import effective_excluded_keys, holding_key
 
 router = APIRouter(prefix="/api/balance", tags=["balance"])
 
@@ -134,7 +134,7 @@ def history(
                 group_name = _display_group(account.group_name)
                 group_values[group_name] = group_values.get(group_name, 0.0) + float(snap.bal or 0)
 
-                excluded = set(account.excluded_keys or [])
+                excluded = set(effective_excluded_keys(db, account))
                 for holding in snap.holdings or []:
                     if not isinstance(holding, dict):
                         continue

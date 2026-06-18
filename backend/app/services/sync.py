@@ -58,6 +58,55 @@ def _excluded_usd(holdings: list[dict[str, Any]], excluded_keys: list[str]) -> f
     )
 
 
+def normalize_excluded_keys(excluded_keys: list[str] | None) -> list[str]:
+    """Canonicalize holding exclusion keys before storing or comparing them."""
+    return sorted({
+        str(key).strip().lower()
+        for key in (excluded_keys or [])
+        if str(key).strip()
+    })
+
+
+def shared_onchain_excluded_keys(db: Session, user_id: str) -> list[str]:
+    """Return the user-level blacklist shared by all on-chain wallet accounts.
+
+    The DB still stores keys on account rows for backwards compatibility and
+    simple persistence, but on-chain wallets use the union as their effective
+    blacklist so spam token contracts excluded once are skipped everywhere.
+    """
+    rows = (
+        db.query(m.AccountRow.excluded_keys)
+        .filter(m.AccountRow.user_id == user_id, m.AccountRow.source == "onchain")
+        .all()
+    )
+    keys: list[str] = []
+    for (excluded_keys,) in rows:
+        keys.extend(excluded_keys or [])
+    return normalize_excluded_keys(keys)
+
+
+def effective_excluded_keys(db: Session, account: m.AccountRow) -> list[str]:
+    if account.source == "onchain":
+        return shared_onchain_excluded_keys(db, account.user_id)
+    return normalize_excluded_keys(account.excluded_keys or [])
+
+
+def apply_shared_onchain_excluded_keys(
+    db: Session,
+    user_id: str,
+    excluded_keys: list[str],
+) -> None:
+    keys = normalize_excluded_keys(excluded_keys)
+    accounts = (
+        db.query(m.AccountRow)
+        .filter(m.AccountRow.user_id == user_id, m.AccountRow.source == "onchain")
+        .all()
+    )
+    for account in accounts:
+        account.excluded_keys = list(keys)
+        recompute_balance_from_snapshot(db, account)
+
+
 def _color_for(key: str) -> str:
     if not key:
         return _HOLDING_PALETTE[0]
@@ -176,6 +225,8 @@ def _build_cex_positions(
     synced balance."""
     if exchange == "derive":
         return _build_derive_positions(positions)
+    if exchange == "polymarket":
+        return _build_polymarket_positions(positions)
     out: list[dict[str, Any]] = []
     proto_label = f"{exchange.upper()} Perp" if exchange == "okx" else exchange.upper()
     for p in positions or []:
@@ -213,6 +264,56 @@ def _build_cex_positions(
             "d": 0.0,
             "c": _color_for(proto_label),
             "logo": None,
+            "proto_logo": None,
+            "apr": None,
+        })
+    out.sort(key=lambda h: h.get("usd", 0.0), reverse=True)
+    return out
+
+
+def _build_polymarket_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for p in positions or []:
+        if not isinstance(p, dict):
+            continue
+        size = float(p.get("size", 0.0) or 0.0)
+        current_value = float(p.get("currentValue", 0.0) or 0.0)
+        if size == 0 and current_value == 0:
+            continue
+        outcome = str(p.get("outcome") or "").strip()
+        title = str(p.get("title") or "").strip()
+        asset = str(p.get("asset") or "").strip()
+        sym = outcome or (asset[:8].upper() if asset else "PM")
+        cur_price = float(p.get("curPrice", 0.0) or 0.0)
+        avg_price = float(p.get("avgPrice", 0.0) or 0.0)
+        cash_pnl = float(p.get("cashPnl", 0.0) or 0.0)
+        pct_pnl = float(p.get("percentPnl", 0.0) or 0.0)
+
+        parts = [part for part in (title, outcome) if part]
+        label = " - ".join(parts) or sym
+        extras: list[str] = []
+        if avg_price > 0:
+            extras.append(f"avg {_fmt_price(avg_price)}")
+        if cash_pnl:
+            sign = "+" if cash_pnl > 0 else "-"
+            extras.append(f"PnL {sign}{_fmt_price(abs(cash_pnl))}")
+        if pct_pnl:
+            extras.append(f"{pct_pnl:+.2f}%")
+        if extras:
+            label = f"{label} ({', '.join(extras)})"
+
+        out.append({
+            "kind": "pos",
+            "sym": sym,
+            "name": label,
+            "proto": "Polymarket",
+            "chain": "polymarket",
+            "amt": _fmt_amount(size),
+            "price": _fmt_price(cur_price or avg_price),
+            "usd": round(current_value, 2),
+            "d": 0.0,
+            "c": _color_for("Polymarket"),
+            "logo": str(p.get("icon") or "") or None,
             "proto_logo": None,
             "apr": None,
         })
@@ -425,7 +526,16 @@ def _is_mock_address(addr: str) -> bool:
     return "…" in addr or "..." in addr
 
 
-_KNOWN_EXCHANGES = ("binance", "bitget", "okx", "bybit", "gate", "extended", "derive")
+_KNOWN_EXCHANGES = (
+    "binance",
+    "bitget",
+    "okx",
+    "bybit",
+    "gate",
+    "extended",
+    "derive",
+    "polymarket",
+)
 
 
 def _infer_exchange(addr: str, explicit: str | None = None) -> str | None:
@@ -458,6 +568,15 @@ def _cex_wallet(account: m.AccountRow, exchange: str, cred: m.CexCredentialRow) 
     }
 
 
+def _is_0x_address(value: str) -> bool:
+    address = str(value or "").strip()
+    return (
+        len(address) == 42
+        and address.startswith("0x")
+        and all(c in "0123456789abcdefABCDEF" for c in address[2:])
+    )
+
+
 def account_uses_live_prices(db: Session, account: m.AccountRow) -> bool:
     """True when syncing this account will call a live price provider. Any account
     with a ``price_source="api"`` custom asset triggers a live lookup,
@@ -466,6 +585,16 @@ def account_uses_live_prices(db: Session, account: m.AccountRow) -> bool:
         isinstance(a, dict) and (a.get("price_source") or "custom") == "api"
         for a in (account.custom_assets or [])
     )
+
+
+def account_uses_sync_throttle(db: Session, account: m.AccountRow) -> bool:
+    """True when syncing this account consumes operator-managed provider quota."""
+    return _hits_paid_api(account) or account_uses_live_prices(db, account)
+
+
+def user_uses_sync_throttle(db: Session, user_id: str) -> bool:
+    accounts = db.query(m.AccountRow).filter(m.AccountRow.user_id == user_id).all()
+    return any(account_uses_sync_throttle(db, account) for account in accounts)
 
 
 def _persist_snapshot(
@@ -607,6 +736,7 @@ def _sync_onchain(db: Session, account: m.AccountRow) -> SyncResult:
     alchemy_key = (os.getenv("ALCHEMY_API_KEY") or "").strip()
     if not alchemy_key:
         return _result(account, "error", message="Server missing ALCHEMY_API_KEY")
+    excluded_keys = effective_excluded_keys(db, account)
     try:
         if chain in ("solana", "sui"):
             from ..integrations.alchemy import (
@@ -621,7 +751,7 @@ def _sync_onchain(db: Session, account: m.AccountRow) -> SyncResult:
             payload = fetcher(
                 account.addr,
                 api_key=alchemy_key,
-                excluded_token_keys=account.excluded_keys or [],
+                excluded_token_keys=excluded_keys,
             )
             new_bal = float(payload.get("balance", 0.0) or 0.0)
             holdings = _build_alchemy_holdings(payload.get("assets") or [])
@@ -638,7 +768,7 @@ def _sync_onchain(db: Session, account: m.AccountRow) -> SyncResult:
                 alchemy_key,
                 networks,
                 timeout=8.0,
-                excluded_token_keys=account.excluded_keys or [],
+                excluded_token_keys=excluded_keys,
             )
             new_bal = float(payload.get("balance", 0.0) or 0.0)
             holdings = _build_alchemy_holdings(payload.get("assets") or [])
@@ -844,6 +974,12 @@ def _validate_exchange(
         )
     if cred is None or (not cred.api_key and not cred.wallet_address):
         raise ValidationFailed(f"{exchange} credentials not set")
+    if exchange == "polymarket":
+        if not _is_0x_address(cred.wallet_address or ""):
+            raise ValidationFailed(
+                "Polymarket wallet address must be a full 0x... address"
+            )
+        return
     try:
         from ..integrations.cex import fetch_cex_assets
 

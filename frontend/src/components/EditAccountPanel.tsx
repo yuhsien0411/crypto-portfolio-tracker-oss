@@ -37,6 +37,7 @@ const EXCHANGES: ExchangeDef[] = [
   { id: "extended", label: "Extended", fields: ["api_key"] },
   { id: "hyperliquid", label: "Hyperliquid", fields: ["wallet_address"] },
   { id: "derive", label: "Derive", fields: ["wallet_address", "api_secret"] },
+  { id: "polymarket", label: "Polymarket", fields: ["wallet_address"] },
 ];
 
 const FIELD_LABELS: Record<CredField, string> = {
@@ -266,7 +267,18 @@ export function EditAccountPanel({
             passphrase: credValues.passphrase.trim(),
             wallet_address: credValues.wallet_address.trim(),
           };
-          await api.setCexCredential(saved.id, credPayload);
+          try {
+            await api.setCexCredential(saved.id, credPayload);
+          } catch (e) {
+            if (isNew) {
+              try {
+                await api.deleteAccount(saved.id);
+              } catch {
+                // best-effort rollback; surface the validation error below
+              }
+            }
+            throw e;
+          }
         }
       }
 

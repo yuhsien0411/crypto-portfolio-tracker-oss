@@ -16,6 +16,8 @@ hosted billing, no email provider required.
 - **Exchanges & perp DEXs** — Binance · Bitget · OKX · Bybit · Gate ·
   Hyperliquid · Derive · Extended. Keys are entered in the UI and stored
   **encrypted at rest**.
+- **Polymarket** accounts track public profile positions plus idle pUSD cash on
+  Polygon, so `ALCHEMY_API_KEY` is required for complete Polymarket net worth.
 - **Custom assets** — anything off-API (cold storage, OTC, vault shares), with
   optional live pricing from DefiLlama, then DexScreener as fallback.
 - **Groups, balance history, daily auto-sync**, and a per-asset/per-account

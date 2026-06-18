@@ -39,4 +39,4 @@ dist/
 build/
 .vite/
 
-scripts/
+scripts/*

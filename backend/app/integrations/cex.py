@@ -10,6 +10,8 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +24,8 @@ try:
 except ModuleNotFoundError:
     Account = None
     encode_defunct = None
+
+_log = logging.getLogger(__name__)
 
 
 def _now_ms() -> int:
@@ -55,8 +59,17 @@ def _request_json(
         headers=headers or {},
         method=method.upper(),
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    host = urllib.parse.urlparse(final_url).netloc or final_url
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        raise
+    except urllib.error.URLError as exc:
+        reason = exc.reason if getattr(exc, "reason", None) else exc
+        raise RuntimeError(f"Could not reach {host}: {reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(f"Timed out connecting to {host}") from exc
 
 
 def _request_json_allow_statuses(
@@ -932,6 +945,8 @@ def fetch_okx_assets(wallet: dict[str, Any]) -> dict[str, Any]:
     assets: list[dict[str, Any]] = []
     raw_positions: list[dict[str, Any]] = []
     total_balance = 0.0
+    earn_detail_total = 0.0
+    valuation_earn_total: float | None = None
     # Unit prices discovered from the unified account so funding/earn/staking
     # entries (which return amounts only) can be valued without an extra
     # ticker round-trip when the same currency is held in trading.
@@ -972,6 +987,25 @@ def fetch_okx_assets(wallet: dict[str, Any]) -> dict[str, Any]:
             }
         )
     strategies.append("okx /api/v5/account/balance")
+
+    # OKX's web "Earn activities" bucket is exposed as an account-class
+    # valuation even when individual Earn product endpoints don't return the
+    # underlying positions. Use it later as a top-up over any detailed Earn
+    # rows we can read, so displayed holdings reconcile with the OKX web total
+    # without double-counting products that do expose detail.
+    valuation_data, valuation_err = _okx_request(
+        creds,
+        "/api/v5/asset/asset-valuation",
+        params={"ccy": "USDT"},
+        allow_failure=True,
+    )
+    if isinstance(valuation_data, list) and valuation_data and isinstance(valuation_data[0], dict):
+        details = valuation_data[0].get("details") or {}
+        if isinstance(details, dict):
+            valuation_earn_total = _to_float(details.get("earn"))
+        strategies.append("okx /api/v5/asset/asset-valuation")
+    elif valuation_err:
+        errors.append(valuation_err)
 
     # 2. Open derivatives positions — informational. Equity is already in
     # totalEq, so these are surfaced as `kind=pos` holdings without adding
@@ -1082,6 +1116,7 @@ def fetch_okx_assets(wallet: dict[str, Any]) -> dict[str, Any]:
             )
             savings_total += usd_value
         total_balance += savings_total
+        earn_detail_total += savings_total
         strategies.append("okx /api/v5/finance/savings/balance")
     elif sav_err:
         errors.append(sav_err)
@@ -1128,9 +1163,27 @@ def fetch_okx_assets(wallet: dict[str, Any]) -> dict[str, Any]:
                 )
                 staking_total += usd_value
         total_balance += staking_total
+        earn_detail_total += staking_total
         strategies.append("okx /api/v5/finance/staking-defi/orders-active")
     elif stk_err:
         errors.append(stk_err)
+
+    if valuation_earn_total is not None:
+        earn_gap = max(valuation_earn_total - earn_detail_total, 0.0)
+        if earn_gap >= 0.01:
+            assets.append(
+                {
+                    "name": "OKX Earn Activities",
+                    "symbol": "OKX-EARN",
+                    "chain": "okx-earn",
+                    "amount": earn_gap,
+                    "available": 0.0,
+                    "locked": earn_gap,
+                    "unit_price": 1.0,
+                    "usd_value": earn_gap,
+                }
+            )
+            total_balance += earn_gap
 
     return {
         "balance": total_balance,
@@ -1409,9 +1462,11 @@ def _fetch_bybit_fiat_assets(
         allow_failure=True,
     )
     if error:
-        print("error", error)
+        if "permission denied" in error.lower():
+            _log.debug("bybit: skipping optional fiat balance query: %s", error)
+            return 0.0, [], None, None
+        _log.warning("bybit: fiat balance query failed: %s", error)
         return 0.0, [], None, error
-    print(payload)
     result = payload.get("result", []) if isinstance(payload, dict) else []
     rows = result if isinstance(result, list) else [result]
     total_usd = 0.0
@@ -2121,6 +2176,133 @@ def fetch_hyperliquid_assets(wallet: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_POLYMARKET_PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+_POLYMARKET_USDCE = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+_POLYMARKET_PAGE_LIMIT = 500
+
+
+def _require_0x_address(value: str, *, label: str) -> str:
+    address = str(value or "").strip()
+    if (
+        len(address) != 42
+        or not address.startswith("0x")
+        or any(c not in "0123456789abcdefABCDEF" for c in address[2:])
+    ):
+        raise RuntimeError(f"{label} must be a valid 0x... wallet address.")
+    return address
+
+
+def _polymarket_profile_address(address: str) -> str:
+    payload = _request_json_allow_statuses(
+        "https://gamma-api.polymarket.com/public-profile",
+        params={"address": address},
+        allowed_statuses={404},
+    )
+    if payload is None:
+        raise RuntimeError(
+            "Polymarket profile not found for this wallet address."
+        )
+    if not isinstance(payload, dict):
+        raise RuntimeError("Polymarket profile response was not a JSON object.")
+    proxy = str(payload.get("proxyWallet") or "").strip()
+    return _require_0x_address(proxy or address, label="Polymarket proxy wallet")
+
+
+def _polymarket_positions_value(proxy_wallet: str) -> float:
+    payload = _request_json(
+        "https://data-api.polymarket.com/value",
+        params={"user": proxy_wallet},
+    )
+    if not isinstance(payload, list):
+        raise RuntimeError("Polymarket value response was not a JSON array.")
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        user = str(item.get("user") or "").strip().lower()
+        if user and user != proxy_wallet.lower():
+            continue
+        return _to_float(item.get("value"))
+    return 0.0
+
+
+def _polymarket_positions(proxy_wallet: str) -> list[dict[str, Any]]:
+    positions: list[dict[str, Any]] = []
+    offset = 0
+    while offset <= 10000:
+        payload = _request_json(
+            "https://data-api.polymarket.com/positions",
+            params={
+                "user": proxy_wallet,
+                "sizeThreshold": 0,
+                "limit": _POLYMARKET_PAGE_LIMIT,
+                "offset": offset,
+                "sortBy": "CURRENT",
+                "sortDirection": "DESC",
+            },
+        )
+        if not isinstance(payload, list):
+            raise RuntimeError("Polymarket positions response was not a JSON array.")
+        page = [p for p in payload if isinstance(p, dict)]
+        positions.extend(page)
+        if len(page) < _POLYMARKET_PAGE_LIMIT:
+            break
+        offset += _POLYMARKET_PAGE_LIMIT
+    return positions
+
+
+def _polymarket_idle_cash(proxy_wallet: str) -> dict[str, float]:
+    api_key = (os.getenv("ALCHEMY_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "Server missing ALCHEMY_API_KEY; Polymarket sync needs it to include idle cash."
+        )
+    from .alchemy import ALCHEMY_NETWORKS, _fetch_erc20_balance
+
+    polygon = ALCHEMY_NETWORKS["polygon"]
+    url = polygon["url"].format(api_key=api_key)
+    return {
+        "pUSD": _fetch_erc20_balance(url, proxy_wallet, _POLYMARKET_PUSD, timeout=8.0) / 1_000_000,
+        "USDC.e": _fetch_erc20_balance(url, proxy_wallet, _POLYMARKET_USDCE, timeout=8.0) / 1_000_000,
+    }
+
+
+def fetch_polymarket_assets(wallet: dict[str, Any]) -> dict[str, Any]:
+    supplied = str(wallet.get("address") or wallet.get("wallet_address") or "").strip()
+    address = _require_0x_address(supplied, label="Polymarket wallet address")
+    proxy_wallet = _polymarket_profile_address(address)
+    positions_value = _polymarket_positions_value(proxy_wallet)
+    positions = _polymarket_positions(proxy_wallet)
+    idle_cash = _polymarket_idle_cash(proxy_wallet)
+
+    assets: list[dict[str, Any]] = []
+    for symbol, amount in idle_cash.items():
+        if amount <= 0:
+            continue
+        assets.append(
+            {
+                "name": symbol,
+                "symbol": symbol,
+                "chain": "polymarket-cash",
+                "amount": amount,
+                "available": amount,
+                "locked": 0.0,
+                "unit_price": 1.0,
+                "usd_value": amount,
+            }
+        )
+    idle_cash_total = sum(idle_cash.values())
+
+    return {
+        "balance": positions_value + idle_cash_total,
+        "assets": assets,
+        "positions": positions,
+        "fetch_strategy": (
+            "polymarket public-profile + data-api value/positions + polygon pUSD/USDC.e"
+        ),
+        "proxy_wallet": proxy_wallet,
+    }
+
+
 def _derive_auth_headers(wallet_address: str, private_key: str) -> dict[str, str]:
     if Account is None or encode_defunct is None:
         raise RuntimeError(
@@ -2349,4 +2531,6 @@ def fetch_cex_assets(wallet: dict[str, Any]) -> dict[str, Any]:
         return fetch_derive_assets(wallet)
     if exchange == "hyperliquid":
         return fetch_hyperliquid_assets(wallet)
+    if exchange == "polymarket":
+        return fetch_polymarket_assets(wallet)
     raise ValueError(f"Unsupported CEX exchange '{exchange}'.")

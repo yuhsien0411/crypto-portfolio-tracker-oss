@@ -41,7 +41,8 @@ def sync_all(
     user: m.UserRow = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> SyncSummary:
-    _enforce_sync_throttle(user.id)
+    if sync_service.user_uses_sync_throttle(db, user.id):
+        _enforce_sync_throttle(user.id)
     results = sync_service.sync_user_accounts(db, user.id)
     total = sum(
         a.bal
@@ -70,10 +71,7 @@ def sync_one(
     # Skip the throttle for an account's first sync — the "create new account"
     # flow on the frontend immediately syncs the account it just created, and
     # we want users to be able to add several accounts back-to-back.
-    needs_throttle = (
-        account.source != "custom"
-        or sync_service.account_uses_live_prices(db, account)
-    )
+    needs_throttle = sync_service.account_uses_sync_throttle(db, account)
     if needs_throttle and account.snapshot is not None:
         _enforce_sync_throttle(user.id)
     result = sync_service.sync_account(db, account)
